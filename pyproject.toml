@@ -1,0 +1,16 @@
+[project]
+name = "harmonic-core"
+version = "1.0"
+description = "Harmonic PBCC"
+requires-python = "==3.*"
+dependencies = ["protobuf", "types-protobuf", "grpcio-tools"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+indent-width = 4
+
+[tool.ruff.format]
+indent-style = "space"
+line-ending = "lf"
+quote-style = "double"

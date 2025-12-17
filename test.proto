@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+// This protobuf file is used for testing the pbcc compiler.
+
+enum TestEnum1 {
+    TEST_E1_VALUE1 = 0;
+    TEST_E1_VALUE2 = 5;
+    TEST_E1_VALUE3 = 10;
+}
+
+enum TestEnum2 {
+    TEST_E2_VALUE1 = 0;
+    TEST_E2_VALUE2 = -1;
+    TEST_E2_VALUE3 = 1;
+}
+
+message TestPrimitives {
+    int32 f_int32 = 1;
+    int64 f_int64 = 2;
+    uint32 f_uint32 = 3;
+    uint64 f_uint64 = 4;
+    sint32 f_sint32 = 5;
+    sint64 f_sint64 = 6;
+    fixed32 f_fixed32 = 7;
+    fixed64 f_fixed64 = 8;
+    sfixed32 f_sfixed32 = 9;
+    sfixed64 f_sfixed64 = 10;
+    bool f_bool = 11;
+    TestEnum1 f_enum1 = 12;
+    TestEnum2 f_enum2 = 13;
+    float f_float = 14;
+    double f_double = 15;
+    bytes f_bytes = 16;
+    string f_string = 17;
+}
+message TestFloatPrimitivesOnly {
+    float f_float = 14;
+    double f_double = 15;
+}
+
+message TestListPrimitives {
+    repeated int32 f_int32 = 1;
+    repeated int64 f_int64 = 2;
+    repeated uint32 f_uint32 = 3;
+    repeated uint64 f_uint64 = 4;
+    repeated sint32 f_sint32 = 5;
+    repeated sint64 f_sint64 = 6;
+    repeated fixed32 f_fixed32 = 7;
+    repeated fixed64 f_fixed64 = 8;
+    repeated sfixed32 f_sfixed32 = 9;
+    repeated sfixed64 f_sfixed64 = 10;
+    repeated bool f_bool = 11;
+    repeated TestEnum1 f_enum1 = 12;
+    repeated TestEnum2 f_enum2 = 13;
+    repeated float f_float = 14;
+    repeated double f_double = 15;
+    repeated bytes f_bytes = 16;
+    repeated string f_string = 17;
+}
+
+message TestOptionalPrimitives {
+    optional int32 f_int32 = 1;
+    optional int64 f_int64 = 2;
+    optional uint32 f_uint32 = 3;
+    optional uint64 f_uint64 = 4;
+    optional sint32 f_sint32 = 5;
+    optional sint64 f_sint64 = 6;
+    optional fixed32 f_fixed32 = 7;
+    optional fixed64 f_fixed64 = 8;
+    optional sfixed32 f_sfixed32 = 9;
+    optional sfixed64 f_sfixed64 = 10;
+    optional bool f_bool = 11;
+    optional TestEnum1 f_enum1 = 12;
+    optional TestEnum2 f_enum2 = 13;
+    optional float f_float = 14;
+    optional double f_double = 15;
+    optional bytes f_bytes = 16;
+    optional string f_string = 17;
+}
+
+message TestMaps {
+    map<int32, string> f_int32_string = 1;
+    map<int64, string> f_int64_string = 2;
+    map<uint32, string> f_uint32_string = 3;
+    map<uint64, string> f_uint64_string = 4;
+    map<sint32, string> f_sint32_string = 5;
+    map<sint64, string> f_sint64_string = 6;
+    map<fixed32, string> f_fixed32_string = 7;
+    map<fixed64, string> f_fixed64_string = 8;
+    map<sfixed32, string> f_sfixed32_string = 9;
+    map<sfixed64, string> f_sfixed64_string = 10;
+    map<bool, string> f_bool_string = 11;
+    // Enums, floats, doubles, and bytes are not allowed as map keys according to the Protocol Buffers specification,
+    // though intuitively it seems like enums and bytes should be allowed. Still, we follow the spec and disallow them.
+    // map<Enum1, string> f_enum1_string = 12;
+    // map<Enum2, string> f_enum2_string = 13;
+    // map<float, string> f_float_string = 14;
+    // map<double, string> f_double_string = 15;
+    // map<bytes, string> f_bytes_string = 16;
+    map<string, string> f_string_string = 17;
+
+    map<string, int32> f_string_int32 = 101;
+    map<string, int64> f_string_int64 = 102;
+    map<string, uint32> f_string_uint32 = 103;
+    map<string, uint64> f_string_uint64 = 104;
+    map<string, sint32> f_string_sint32 = 105;
+    map<string, sint64> f_string_sint64 = 106;
+    map<string, fixed32> f_string_fixed32 = 107;
+    map<string, fixed64> f_string_fixed64 = 108;
+    map<string, sfixed32> f_string_sfixed32 = 109;
+    map<string, sfixed64> f_string_sfixed64 = 110;
+    map<string, bool> f_string_bool = 111;
+    map<string, TestEnum1> f_string_enum1 = 112;
+    map<string, TestEnum2> f_string_enum2 = 113;
+    map<string, float> f_string_float = 114;
+    map<string, double> f_string_double = 115;
+    map<string, bytes> f_string_bytes = 116;
+    // map<string, string> f_string_string = 117; // Same as field 17
+    map<string, TestPrimitives> f_string_message = 118;
+}
+
+message TestSubmessages {
+    TestPrimitives f_primitives = 1;
+    TestListPrimitives f_list_primitives = 2;
+    TestOptionalPrimitives f_optional_primitives = 3;
+    TestMaps f_maps = 4;
+    map<string, TestPrimitives> f_string_primitives = 5;
+
+    optional TestPrimitives f_optional_msg_primitives = 6;
+    repeated TestPrimitives f_repeated_msg_primitives = 7;
+}
+
+message TestOneofs {
+    oneof f_int_or_bytes {
+        uint64 f_int = 1;
+        bytes f_bytes = 2;
+    }
+    oneof f_string_or_float {
+        string f_string = 3;
+        float f_float = 4;
+    }
+    oneof f_submessage {
+        TestPrimitives f_primitives = 5;
+        TestListPrimitives f_list_primitives = 6;
+        TestOptionalPrimitives f_optional_primitives = 7;
+    }
+}
+
+message TestFieldOrdering {
+    string last_field = 5;
+    int32 first_field = 1;
+    string middle_field = 3;
+    int32 second_field = 2;
+    string fourth_field = 4;
+}
