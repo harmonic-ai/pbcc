@@ -2,7 +2,7 @@
 name = "harmonic-core"
 version = "1.0"
 description = "Harmonic PBCC"
-requires-python = "==3.*"
+requires-python = ">=3.10"
 dependencies = ["protobuf", "types-protobuf", "grpcio-tools"]
 
 [tool.ruff]
