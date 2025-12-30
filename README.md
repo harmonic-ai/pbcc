@@ -4,7 +4,7 @@ pbcc is an implementation of Protocol Buffers for Python, designed for speed, sa
 
 Here is a contrived example Protobuf definition:
 
-```
+```protobuf
 // my_interface.proto
 syntax = "proto3";
 enum MyEnum {
