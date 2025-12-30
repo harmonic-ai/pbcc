@@ -291,7 +291,6 @@ class MessageInfo:
         add_line("")
         add_line("    def has_unknown_fields(self) -> bool: ...")
         add_line("    def delete_unknown_fields(self) -> None: ...")
-        add_line("    def get_unknown_fields(self) -> dict[int, bytes]: ...")
         return ret
 
 

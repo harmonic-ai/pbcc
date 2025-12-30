@@ -42,7 +42,7 @@ class my_interface:
         # Constructs a new LongMessage
         def __init__(self, *,
             f_oneof: MyEnum = MyEnum.VALUE0,
-            f_uint64: list[int] = 0,
+            f_uint64: list[int] = [],
             f_maybe_bytes: bytes | None = None,
             f_map_str_float: dict[str, float] = {},
         ): ...
@@ -80,5 +80,4 @@ class my_interface:
         # Functions for dealing with unparsed fields that weren't part of the message definition
         def has_unknown_fields(self) -> bool: ...
         def delete_unknown_fields(self) -> None: ...
-        def get_unknown_fields(self) -> dict[int, bytes]: ...
 ```
