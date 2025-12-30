@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+import sysconfig
 import tempfile
 from typing import Any, Awaitable, Iterable, Literal, Sequence, cast
 
@@ -429,7 +430,7 @@ class ModuleCollection:
                 fi = FieldInfo(
                     py_name=py_name,
                     is_optional=is_optional,
-                    is_repeated=(fld_desc.label == FieldDescriptor.LABEL_REPEATED),
+                    is_repeated=fld_desc.is_repeated,
                     data_type=data_type,
                     enum=fld_enum,
                     submessage=fld_msg,
@@ -855,15 +856,25 @@ class ModuleCollection:
 
 
 async def get_compiler_args() -> list[str]:
+    # Get the actual Python installation directory
+    # sysconfig.get_config_var('BINDIR') gives us the real bin directory
+    python_bin_dir = sysconfig.get_config_var("BINDIR")
+    if python_bin_dir is None:
+        # Fallback to the directory containing sys.executable
+        python_bin_dir = os.path.dirname(os.path.realpath(sys.executable))
+
+    python_config = os.path.join(python_bin_dir, "python3-config")
+
     (cflags, _), (ldflags, _) = await asyncio.gather(
-        check_output_async("python3.10-config", "--cflags"),
-        check_output_async("python3.10-config", "--ldflags"),
+        check_output_async(python_config, "--cflags"),
+        check_output_async(python_config, "--ldflags"),
     )
     ret = [flag.decode("utf-8") for flag in cflags.split() + ldflags.split()]
     ret.append("-std=c++20")
     ret.append("-Wall")
     ret.append("-Wextra")
     ret.append("-Werror")
+    ret.append("-Wno-error=missing-field-initializers")
     ret.append("-fPIC")
     return ret
 
