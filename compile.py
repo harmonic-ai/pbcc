@@ -858,13 +858,13 @@ class ModuleCollection:
 async def get_compiler_args() -> list[str]:
     # Get the actual Python installation directory
     # sysconfig.get_config_var('BINDIR') gives us the real bin directory
-    python_bin_dir = sysconfig.get_config_var('BINDIR')
+    python_bin_dir = sysconfig.get_config_var("BINDIR")
     if python_bin_dir is None:
         # Fallback to the directory containing sys.executable
         python_bin_dir = os.path.dirname(os.path.realpath(sys.executable))
-    
+
     python_config = os.path.join(python_bin_dir, "python3-config")
-    
+
     (cflags, _), (ldflags, _) = await asyncio.gather(
         check_output_async(python_config, "--cflags"),
         check_output_async(python_config, "--ldflags"),

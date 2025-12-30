@@ -1,3 +1,5 @@
 test_modules/
 __pycache__/
 .venv
+*.egg-info
+my_interface.*
