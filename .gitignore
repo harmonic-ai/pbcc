@@ -2,3 +2,5 @@ __pycache__/
 .venv
 .mypy_cache
 pbcc/test_modules/
+*.egg-info
+my_interface.*
