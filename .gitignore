@@ -1,3 +1,4 @@
-test_modules/
 __pycache__/
 .venv
+.mypy_cache
+pbcc/test_modules/

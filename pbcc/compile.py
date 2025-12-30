@@ -22,7 +22,7 @@ from google.protobuf.descriptor import (
     OneofDescriptor,
 )
 
-from async_utils import check_call_async, check_output_async
+from .async_utils import check_call_async, check_output_async
 
 
 class DataType(enum.Enum):
@@ -972,5 +972,9 @@ async def main() -> None:
         )
 
 
+def main_sync() -> None:
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    main_sync()

@@ -22,7 +22,7 @@ message LongMessage {
 }
 ```
 
-To build a file like this, run `uv run compile.py --proto-files my_interface.proto --output-basename my_interface`. This will produce the files my_interface.cc (the C++ extension module source), my_interface.so (the compiled C++ extension module), and my_interface.pyi (the type annotations for the extension module). Here is the resulting pbcc module's interface:
+To build a file like this, run `uv run -m pbcc.compile --proto-files my_interface.proto --output-basename my_interface`. This will produce the files my_interface.cc (the C++ extension module source), my_interface.so (the compiled C++ extension module), and my_interface.pyi (the type annotations for the extension module). Here is the resulting pbcc module's interface:
 
 ```python
 # Since multiple .proto modules can be built into a single pbcc module, the

@@ -680,7 +680,7 @@ wheels = [
 ]
 
 [[package]]
-name = "harmonic-core"
+name = "pbcc"
 version = "1.0"
 source = { virtual = "." }
 dependencies = [

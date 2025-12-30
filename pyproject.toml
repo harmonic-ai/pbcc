@@ -1,5 +1,5 @@
 [project]
-name = "harmonic-core"
+name = "pbcc"
 version = "1.0"
 description = "Harmonic PBCC"
 requires-python = "==3.*"
