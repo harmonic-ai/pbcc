@@ -907,11 +907,36 @@ async def compile_modules(
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("module_names", type=str, nargs="+")
-    parser.add_argument("--no-line-directives", action="store_true", default=False)
-    parser.add_argument("--source-only", action="store_true", default=False)
-    parser.add_argument("--output-basename", type=str, required=True)
-    parser.add_argument("--proto-files", action="store_true", default=False)
+    parser.add_argument(
+        "module_names",
+        type=str,
+        nargs="+",
+        help="names of pb2 modules to compile, or paths to .proto files if --proto-files is given",
+    )
+    parser.add_argument(
+        "--no-line-directives",
+        action="store_true",
+        default=False,
+        help="don't generate #line directives in the C++ source",
+    )
+    parser.add_argument(
+        "--source-only",
+        action="store_true",
+        default=False,
+        help="just generate the .pyi and .cc files; don't compile the .so",
+    )
+    parser.add_argument(
+        "--output-basename",
+        type=str,
+        required=True,
+        help="the base filename (without extension) for the generated files",
+    )
+    parser.add_argument(
+        "--proto-files",
+        action="store_true",
+        default=False,
+        help="treat module_names as .proto file paths instead of Python module names",
+    )
     args = parser.parse_args()
 
     if args.proto_files:
