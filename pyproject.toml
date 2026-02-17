@@ -14,3 +14,10 @@ indent-width = 4
 indent-style = "space"
 line-ending = "lf"
 quote-style = "double"
+
+[build-system]                                                                                                                                                                                                                                  
+requires = ["setuptools"]                                                                                                                                                                                                                       
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]                                                                                                                                                                                                                  
+pbcc = ["*.cc", "*.proto"]     
