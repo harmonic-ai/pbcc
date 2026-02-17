@@ -426,10 +426,14 @@ class ModuleCollection:
                         data_type = DataType.MAP
                 else:
                     fld_msg = None
+                try:
+                    is_repeated = fld_desc.is_repeated
+                except AttributeError:
+                    is_repeated = fld_desc.label == FieldDescriptor.LABEL_REPEATED
                 fi = FieldInfo(
                     py_name=py_name,
                     is_optional=is_optional,
-                    is_repeated=fld_desc.is_repeated,
+                    is_repeated=is_repeated,
                     data_type=data_type,
                     enum=fld_enum,
                     submessage=fld_msg,
