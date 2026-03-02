@@ -14,6 +14,7 @@ import sysconfig
 import tempfile
 from typing import Any, Awaitable, Iterable, Literal, Sequence, cast
 
+from async_utils import check_call_async, check_output_async
 from google.protobuf.descriptor import Descriptor as MessageDescriptor
 from google.protobuf.descriptor import (
     EnumDescriptor,
@@ -22,8 +23,6 @@ from google.protobuf.descriptor import (
     FileDescriptor,
     OneofDescriptor,
 )
-
-from .async_utils import check_call_async, check_output_async
 
 
 class DataType(enum.Enum):

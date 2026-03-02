@@ -23,16 +23,16 @@ subprocess.check_call(
         "-m",
         "grpc_tools.protoc",
         "-I.",
-        "test.proto",
+        "pbcc/test.proto",
         "--python_out=test_modules",
         "--pyi_out=test_modules",
     )
 )
-import test_modules.test_pb2 as pb  # noqa: E402
+import test_modules.pbcc.test_pb2 as pb  # noqa: E402
 
 print("Building test_pbcc")
 subprocess.check_call(
-    (sys.executable, "compile.py", "test_modules.test_pb2", "--output-basename", "test_modules/test_pbcc")
+    (sys.executable, "pbcc/compile.py", "test_modules.test_pb2", "--output-basename", "test_modules/test_pbcc")
 )
 import test_modules.test_pbcc as pbcc  # noqa: E402
 
