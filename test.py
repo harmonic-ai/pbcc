@@ -32,7 +32,7 @@ import test_modules.pbcc.test_pb2 as pb  # noqa: E402
 
 print("Building test_pbcc")
 subprocess.check_call(
-    (sys.executable, "pbcc/compile.py", "test_modules.test_pb2", "--output-basename", "test_modules/test_pbcc")
+    (sys.executable, "pbcc/compile.py", "pbcc/test.proto", "--output-basename", "test_modules/test_pbcc")
 )
 import test_modules.test_pbcc as pbcc  # noqa: E402
 
@@ -2346,11 +2346,7 @@ def run_all_tests() -> int:
             traceback.print_exc()
             num_failures += 1
 
-    if num_failures == 0:
-        print(f"... {len(ALL_TEST_CASES)} TESTS PASSED")
-    else:
-        print(f"... {num_failures}/{len(ALL_TEST_CASES)} TESTS FAILED")
-
+    print(f"... PASS: {len(ALL_TEST_CASES) - num_failures}, FAIL: {num_failures}")
     return num_failures
 
 

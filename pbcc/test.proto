@@ -14,6 +14,7 @@ enum TestEnum2 {
     TEST_E2_VALUE3 = 1;
 }
 
+// This is a message comment. It should be attached to TestPrimitives.
 message TestPrimitives {
     int32 f_int32 = 1;
     int64 f_int64 = 2;
@@ -21,6 +22,7 @@ message TestPrimitives {
     uint64 f_uint64 = 4;
     sint32 f_sint32 = 5;
     sint64 f_sint64 = 6;
+    // This is a field comment. It should be attacked fo f_fixed32.
     fixed32 f_fixed32 = 7;
     fixed64 f_fixed64 = 8;
     sfixed32 f_sfixed32 = 9;
@@ -99,6 +101,7 @@ message TestMaps {
     // map<bytes, string> f_bytes_string = 16;
     map<string, string> f_string_string = 17;
 
+    // Map fields can have comments too. This one should be attached to f_string_int32.
     map<string, int32> f_string_int32 = 101;
     map<string, int64> f_string_int64 = 102;
     map<string, uint32> f_string_uint32 = 103;
@@ -131,8 +134,10 @@ message TestSubmessages {
 }
 
 message TestOneofs {
+    // This is a oneof comment, attached to f_int_or_bytes.
     oneof f_int_or_bytes {
         uint64 f_int = 1;
+        // Ths fields within oneofs can have comments too. This one is attached to f_bytes.
         bytes f_bytes = 2;
     }
     oneof f_string_or_float {

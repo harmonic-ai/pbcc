@@ -10,12 +10,14 @@ import importlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import sysconfig
 import tempfile
 from typing import Any, Awaitable, Iterable, Literal, Sequence, TextIO, cast
 
+from google.protobuf import descriptor_pb2
 from google.protobuf.descriptor import Descriptor as MessageDescriptor
 from google.protobuf.descriptor import (
     EnumDescriptor,
@@ -24,6 +26,24 @@ from google.protobuf.descriptor import (
     FileDescriptor,
     OneofDescriptor,
 )
+
+
+def escape_triple_double_quotes(s: str) -> str:
+    """Escape content for inclusion inside a triple-double-quoted Python string literal, like this one.
+    - Escape backslashes to avoid accidental escape sequences (e.g. "\n", "\t", "\u1234").
+    - Escape all double quotes to satisfy downstream tooling expectations."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def normalize_proto_comment(s: str) -> str:
+    """Protoc includes leading newlines/spaces in comment blocks; normalize to a clean doc.
+    Keeps internal newlines (multi-line comments are valuable)."""
+    return "\n".join(line.rstrip() for line in s.strip().splitlines()).strip()
+
+
+def normalize_inline_comment(s: str) -> str:
+    """Inline comments must be single-line; collapses whitespace/newlines."""
+    return " ".join(normalize_proto_comment(s).split())
 
 
 async def forward_and_return_data(output: TextIO | None, prefix: str, input: asyncio.StreamReader) -> bytes:
@@ -144,6 +164,19 @@ async def check_call_async(
         raise subprocess.CalledProcessError(retcode, args, stdout, stderr)
 
 
+class TemporaryImportSearchPath:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def __enter__(self):
+        self.orig_sys_path = sys.path[:]
+        if self.path not in sys.path:
+            sys.path.append(self.path)
+
+    def __exit__(self, t, v, tb):
+        sys.path = self.orig_sys_path
+
+
 class DataType(enum.Enum):
     FLOAT = enum.auto()
     DOUBLE = enum.auto()
@@ -234,24 +267,33 @@ class EnumInfo:
     module_name: str
     name: str
     members: dict[str, int]
+    comment: str | None = None
+    member_comments: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def pyi_source_lines(self, indent_level: int = 0) -> list[str]:
         indent_str = "    " * indent_level
         ret = [f"{indent_str}class {cc_name_for_python_name(self.name)}(IntEnum):"]
+        if self.comment:
+            ret.append(f'{indent_str}    """{escape_triple_double_quotes(self.comment)}"""')
         for name, value in sorted(self.members.items(), key=lambda it: it[1]):
+            member_comment = self.member_comments.get(name)
             ret.append(f"{indent_str}    {name} = {value}")
+            if member_comment:
+                ret.append(f'{indent_str}    """{escape_triple_double_quotes(member_comment)}"""')
         return ret
 
 
 @dataclasses.dataclass(kw_only=True)
 class FieldInfo:
     py_name: str
+    proto_field_name: str
     is_optional: bool
     is_repeated: bool
     data_type: DataType
     enum: EnumInfo | None
     submessage: MessageInfo | None
     field_num: int
+    comment: str | None = None
 
     def type_key(self) -> str:
         if self.data_type == DataType.ENUM:
@@ -341,6 +383,31 @@ def py_type_for_field_group(fields: Sequence[FieldInfo]) -> str:
     return " | ".join(types)
 
 
+def docstring_for_field_group(fields: Sequence[FieldInfo], oneof_comment: str | None) -> str | None:
+    # Single-field group: just show that field's comment.
+    if len(fields) == 1:
+        c = fields[0].comment
+        return normalize_proto_comment(c) if c else None
+
+    # Oneof group: combine oneof declaration comment (if any) plus per-option comments.
+    parts: list[str] = []
+    if oneof_comment:
+        parts.append(normalize_proto_comment(oneof_comment))
+
+    option_lines: list[str] = []
+    for fi in sorted(fields, key=lambda f: f.field_num):
+        c = normalize_proto_comment(fi.comment) if fi.comment else ""
+        option_lines.append(f"{fi.proto_field_name}: {c}" if c else f"{fi.proto_field_name}")
+
+    if option_lines:
+        if parts:
+            parts.append("")  # blank line separator
+        parts.append("oneof options:\n" + "\n".join(option_lines))
+
+    doc = "\n".join(parts).strip()
+    return doc or None
+
+
 def full_name_for_descriptor(desc: EnumDescriptor | MessageDescriptor) -> str:
     name: str = desc.name
     containing_message_desc: MessageDescriptor = desc.containing_type
@@ -359,6 +426,126 @@ def namespaced_name_for_descriptor(desc: EnumDescriptor | MessageDescriptor) -> 
     return f"{name_for_module_path(desc.file.name)}.{full_name_for_descriptor(desc)}"
 
 
+@dataclasses.dataclass
+class MessageComments:
+    message: str | None
+    fields: dict[str, str]
+    oneofs: dict[str, str]
+
+
+def extract_comment_maps_from_descriptor_set(
+    fds: descriptor_pb2.FileDescriptorSet,
+) -> dict[str, dict[str, MessageComments]]:
+    all_message_comments: dict[str, dict[str, MessageComments]] = {}
+
+    for fd in fds.file:
+        loc_map: dict[tuple[int, ...], descriptor_pb2.SourceCodeInfo.Location] = {
+            tuple(loc.path): loc for loc in fd.source_code_info.location
+        }
+
+        file_message_comments: dict[str, MessageComments] = {}
+
+        def comment_for_path(path: list[int]) -> str | None:
+            loc = loc_map.get(tuple(path))
+            if loc is None:
+                return None
+
+            parts: list[str] = []
+            # Detached comments are typically preceding "paragraphs".
+            if loc.leading_detached_comments:
+                parts.extend([normalize_proto_comment(s) for s in loc.leading_detached_comments if s.strip()])
+            if loc.leading_comments and loc.leading_comments.strip():
+                parts.append(normalize_proto_comment(loc.leading_comments))
+            if loc.trailing_comments and loc.trailing_comments.strip():
+                parts.append(normalize_proto_comment(loc.trailing_comments))
+            joined = "\n\n".join([p for p in parts if p])
+            return joined or None
+
+        def walk_message(desc: descriptor_pb2.DescriptorProto, prefix: str, base_path: list[int]) -> None:
+            name = desc.name
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            message_comments = MessageComments(message=comment_for_path(base_path), fields={}, oneofs={})
+
+            # Fields: DescriptorProto.field = 2
+            for j, fld in enumerate(desc.field):
+                c = comment_for_path([*base_path, 2, j])
+                if c:
+                    message_comments.fields[fld.name] = c
+
+            # Oneofs: DescriptorProto.oneof_decl = 8
+            for k, oneof in enumerate(desc.oneof_decl):
+                c = comment_for_path([*base_path, 8, k])
+                if c:
+                    message_comments.oneofs[oneof.name] = c
+
+            file_message_comments[full_name] = message_comments
+
+            # Nested messages: DescriptorProto.nested_type = 3
+            for n, nested in enumerate(desc.nested_type):
+                walk_message(nested, full_name, [*base_path, 3, n])
+
+        # Top-level messages: FileDescriptorProto.message_type = 4
+        for i, msg in enumerate(fd.message_type):
+            walk_message(msg, "", [4, i])
+
+        all_message_comments[fd.name] = file_message_comments
+
+    return all_message_comments
+
+
+@dataclasses.dataclass
+class EnumComments:
+    enum: str | None
+    values: dict[str, str]
+
+
+def extract_enum_comment_maps_from_descriptor_set(
+    fds: descriptor_pb2.FileDescriptorSet,
+) -> dict[str, dict[str, EnumComments]]:
+    all_enum_comments: dict[str, dict[str, EnumComments]] = {}
+
+    for fd in fds.file:
+        loc_map: dict[tuple[int, ...], descriptor_pb2.SourceCodeInfo.Location] = {
+            tuple(loc.path): loc for loc in fd.source_code_info.location
+        }
+
+        def comment_for_path(path: list[int]) -> str | None:
+            loc = loc_map.get(tuple(path))
+            if loc is None:
+                return None
+
+            parts: list[str] = []
+            if loc.leading_detached_comments:
+                parts.extend([normalize_proto_comment(s) for s in loc.leading_detached_comments if s.strip()])
+            if loc.leading_comments and loc.leading_comments.strip():
+                parts.append(normalize_proto_comment(loc.leading_comments))
+            if loc.trailing_comments and loc.trailing_comments.strip():
+                parts.append(normalize_proto_comment(loc.trailing_comments))
+            joined = "\n\n".join([p for p in parts if p])
+            return joined or None
+
+        file_enum_comments: dict[str, EnumComments] = {}
+
+        # Top-level enums: FileDescriptorProto.enum_type = 5
+        for i, enum_desc in enumerate(fd.enum_type):
+            enum_name = enum_desc.name  # no package; nested enums not supported by this compiler
+            enum_comment = comment_for_path([5, i])
+            value_comments: dict[str, str] = {}
+
+            # Enum values: EnumDescriptorProto.value = 2
+            for j, v in enumerate(enum_desc.value):
+                c = comment_for_path([5, i, 2, j])
+                if c:
+                    value_comments[v.name] = normalize_inline_comment(c)
+
+            file_enum_comments[enum_name] = EnumComments(enum=enum_comment, values=value_comments)
+
+        all_enum_comments[fd.name] = file_enum_comments
+
+    return all_enum_comments
+
+
 @dataclasses.dataclass(kw_only=True)
 class MessageInfo:
     module_name: str
@@ -366,6 +553,8 @@ class MessageInfo:
     field_for_number: dict[int, FieldInfo] = dataclasses.field(default_factory=dict)
     field_groups: dict[str, list[FieldInfo]] = dataclasses.field(default_factory=lambda: collections.defaultdict(list))
     map_types: tuple[FieldInfo, FieldInfo] | None  # If not None, this message is a map entry message
+    oneof_comments: dict[str, str] = dataclasses.field(default_factory=dict)
+    comment: str | None = None
 
     def pyi_source_lines(self, indent_level: int = 0) -> list[str]:
         indent_str = "    " * indent_level
@@ -382,6 +571,8 @@ class MessageInfo:
         else:
             slots_strs = ", ".join(repr(name) for name in self.field_groups.keys())
         add_line(f"class {cc_cls_name}:")
+        if self.comment:
+            add_line(f'    """{escape_triple_double_quotes(self.comment)}"""')
         add_line(f"    __slots__ = ({slots_strs})")
 
         init_args: list[str] = ["self", "*"]
@@ -389,6 +580,9 @@ class MessageInfo:
             py_type = py_type_for_field_group(field_group)
             field_nums_str = ", ".join(str(f.field_num) for f in field_group)
             add_line(f"    {name}: {py_type}  # {field_nums_str}")
+            doc = docstring_for_field_group(field_group, self.oneof_comments.get(name))
+            if doc:
+                add_line(f'    """{escape_triple_double_quotes(doc)}"""')
             init_args.append(f"{name}: {py_type} = ...")
 
         add_line("")
@@ -441,6 +635,7 @@ class ModuleInfo:
 class ModuleCollection:
     modules: dict[str, ModuleInfo]
     global_aliases: dict[str, MessageInfo | EnumInfo | None] = dataclasses.field(default_factory=dict)
+    proto_file_for_module: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def compute_global_aliases(self) -> None:
         print("Populating global aliases")
@@ -550,6 +745,7 @@ class ModuleCollection:
                     is_repeated = fld_desc.label == FieldDescriptor.LABEL_REPEATED
                 fi = FieldInfo(
                     py_name=py_name,
+                    proto_field_name=fld_desc.name,
                     is_optional=is_optional,
                     is_repeated=is_repeated,
                     data_type=data_type,
@@ -592,6 +788,7 @@ class ModuleCollection:
 
         mod_info = ModuleInfo(name=mod_name, _in_progress=True)
         self.modules[mod_info.name] = mod_info
+        self.proto_file_for_module[mod_info.name] = mod_desc.name
         print(f"... Adding module {mod_info.name}")
 
         for msg_desc in cast(dict[str, MessageDescriptor], mod_desc.message_types_by_name).values():
@@ -602,356 +799,71 @@ class ModuleCollection:
         mod_info._in_progress = False
         return mod_info
 
-    def cc_source(self, so_module_name: str, add_line_directives: bool = True) -> str:
-        template_path = os.path.relpath(os.path.join(os.path.dirname(__file__), "pymodule.in.cc"))
-        with open(template_path, "rt") as f:
-            template_lines = [line.rstrip() for line in f.readlines()]
+    async def attach_proto_comments(self, descriptor_set_filename: str) -> None:
+        proto_files = sorted(set(self.proto_file_for_module.values()))
+        if not proto_files:
+            return
 
-        re_comment_tag = re.compile(r"\s*// (?P<tag>__COMPILER__[A-Za-z0-9_]+?__)$")
-        re_inline_tag = re.compile(r"__COMPILER__[A-Za-z0-9_]+?__")
+        with open(descriptor_set_filename, "rb") as f:
+            desc_bytes = f.read()
+        fds = descriptor_pb2.FileDescriptorSet.FromString(desc_bytes)
 
-        def get_block_end_line(start_line_num: int) -> int:
-            line_num = start_line_num
-            block_stack: list[Literal["FOREACH", "IF"]] = []
-            while line_num == start_line_num or len(block_stack) > 0:
-                comment_tag_m = re_comment_tag.match(template_lines[line_num])
-                line_num += 1
-                if comment_tag_m is None:
+        all_message_comments = extract_comment_maps_from_descriptor_set(fds)
+        all_enum_comments = extract_enum_comment_maps_from_descriptor_set(fds)
+
+        # Attach comments to FieldInfo / MessageInfo objects.
+        for mod_name, mod_info in self.modules.items():
+            proto_file = self.proto_file_for_module.get(mod_name)
+            if not proto_file:
+                continue
+            file_message_comments = all_message_comments.get(proto_file, {})
+            file_enum_comments = all_enum_comments.get(proto_file, {})
+
+            # Enums
+            for enum_info in mod_info.enums.values():
+                enum_comments = file_enum_comments.get(enum_info.name, None)
+                if enum_comments is not None:
+                    enum_info.comment = enum_comments.enum
+                    enum_info.member_comments = enum_comments.values
+
+            for msg in mod_info.messages.values():
+                if msg.map_types is not None:
                     continue
-                tag = comment_tag_m.group("tag")
-                if tag == "__COMPILER__END_IF__":
-                    assert len(block_stack) > 0 and block_stack.pop() == "IF", (
-                        f"Unterminated IF block ending at line {start_line_num + 1}"
-                    )
-                elif tag == "__COMPILER__END_FOREACH__":
-                    assert len(block_stack) > 0 and block_stack.pop() == "FOREACH", (
-                        f"Unterminated FOREACH block ending at line {start_line_num + 1}"
-                    )
-                elif tag.startswith("__COMPILER__IF_"):
-                    block_stack.append("IF")
-                elif tag.startswith("__COMPILER__FOREACH_"):
-                    block_stack.append("FOREACH")
-                else:
-                    assert False, f"Invalid comment tag at line {start_line_num + 1}: {tag}"
-            return line_num
+                message_comments = file_message_comments.get(msg.name, None)
+                if message_comments is not None:
+                    msg.comment = message_comments.message
+                    msg.oneof_comments = message_comments.oneofs
+                    for group in msg.field_groups.values():
+                        for fi in group:
+                            fi.comment = message_comments.fields.get(fi.proto_field_name)
 
-        result_lines: list[str] = []
-
-        def add_line_directive(line_num: int, annotations: Sequence[str]) -> None:
-            if add_line_directives:
-                if annotations:
-                    annotated_filename = template_path + "(" + ",".join(annotations) + ")"
-                else:
-                    annotated_filename = template_path
-                result_lines.append(f'#line {line_num + 1} "{annotated_filename}"')
-
-        def replace_template_scope(
-            start_line_num: int,
-            end_line_num: int,
-            env: dict[str, str],
-            annotations: Sequence[str] = (),
-        ) -> None:
-            add_line_directive(start_line_num, annotations)
-            line_num = start_line_num
-            try:
-                while line_num < end_line_num:
-                    template_line = template_lines[line_num]
-                    comment_tag_m = re_comment_tag.match(template_line)
-                    if comment_tag_m is not None:
-                        tag = comment_tag_m.group("tag")
-                        block_end_line = get_block_end_line(line_num)
-                        match tag:
-                            case "__COMPILER__FOREACH_MODULE__":
-                                for mod_name in sorted(self.modules.keys()):
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__MODULE_NAME__": mod_name,
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"mod={mod_name}"),
-                                    )
-                            case "__COMPILER__FOREACH_ENUM__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                # This ordering is important! We need root objects to appear before their children, so
-                                # e.g. `Message1` appears before `Message1.Submessage1`.
-                                for _, enum in sorted(mod.enums.items()):
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__ENUM_PYTHON_NAME__": enum.name,
-                                        "__COMPILER__ENUM_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(enum.name),
-                                        "__COMPILER__ENUM_CC_NAME__": cc_name_for_enum_or_message_info(enum),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"enum={enum.name}"),
-                                    )
-                            case "__COMPILER__FOREACH_GLOBAL_ENUM_ALIAS__":
-                                for _, ent in sorted(self.global_aliases.items()):
-                                    if ent is None or not isinstance(ent, EnumInfo):
-                                        continue
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__ENUM_PYTHON_NAME__": ent.name,
-                                        "__COMPILER__ENUM_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(ent.name),
-                                        "__COMPILER__ENUM_CC_NAME__": cc_name_for_enum_or_message_info(ent),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"enum={ent.name}"),
-                                    )
-                            case "__COMPILER__FOREACH_ENUM_MEMBER__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                enum = mod.enums[env["__COMPILER__ENUM_PYTHON_NAME__"]]
-                                for member_name, member_value in sorted(enum.members.items()):
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__ENUM_MEMBER_NAME__": member_name,
-                                        "__COMPILER__ENUM_MEMBER_VALUE__": str(member_value),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"mem={member_name}"),
-                                    )
-                            case "__COMPILER__FOREACH_MESSAGE__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                # This ordering is important! We need root objects to appear before their children, so e.g.
-                                # `Message1` appears before `Message1.Submessage1`.
-                                for _, message in sorted(mod.messages.items()):
-                                    if message.map_types is not None:
-                                        continue
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__MESSAGE_PYTHON_NAME__": message.name,
-                                        "__COMPILER__MESSAGE_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(
-                                            message.name
-                                        ),
-                                        "__COMPILER__MESSAGE_CC_NAME__": cc_name_for_enum_or_message_info(message),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"msg={message.name}"),
-                                    )
-                            case "__COMPILER__FOREACH_GLOBAL_MESSAGE_ALIAS__":
-                                for _, ent in sorted(self.global_aliases.items()):
-                                    if ent is None or not isinstance(ent, MessageInfo) or ent.map_types is not None:
-                                        continue
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__MESSAGE_PYTHON_NAME__": ent.name,
-                                        "__COMPILER__MESSAGE_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(ent.name),
-                                        "__COMPILER__MESSAGE_CC_NAME__": cc_name_for_enum_or_message_info(ent),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"msg={ent.name}"),
-                                    )
-                            case "__COMPILER__FOREACH_MESSAGE_FIELD_GROUP__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                # Sort field groups by minimum field number in each group for consistent ordering
-                                sorted_groups = sorted(
-                                    message.field_groups.items(),
-                                    key=lambda item: min(f.field_num for f in item[1]),
-                                )
-                                for group_name, fields in sorted_groups:
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__MESSAGE_FIELD_GROUP_NAME__": group_name,
-                                        "__COMPILER__MESSAGE_FIELD_GROUP_DEFAULT_VALUE_CONSTRUCTOR__": default_value_constructor_for_field_group(
-                                            fields
-                                        ),
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"grp={group_name}"),
-                                    )
-                            case "__COMPILER__FOREACH_MESSAGE_FIELD_IN_GROUP__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
-                                for field in sorted(group, key=lambda f: f.field_num):
-                                    enum_ref = "nullptr"
-                                    parse_fn = "nullptr"
-                                    serialize_fn = "nullptr"
-                                    submessage_type_obj = "nullptr"
-                                    # These two should only be used within a __COMPILER__IF_MESSAGE_FIELD_TYPE_MAP__,
-                                    # so we intentionally use values that won't compile
-                                    key_type = "__INVALID__"
-                                    value_type = "__INVALID__"
-                                    value_enum_ref = "nullptr"
-                                    value_parse_fn = "nullptr"
-                                    value_serialize_fn = "nullptr"
-                                    value_submessage_type_obj = "nullptr"
-
-                                    if field.enum is not None:
-                                        enum_ref = f"&{cc_name_for_enum_or_message_info(field.enum)}_enum_ref"
-                                    if field.submessage is not None:
-                                        submsg_cc_name = cc_name_for_enum_or_message_info(field.submessage)
-                                        parse_fn = (
-                                            f"reinterpret_cast<ParseMessageFn>({submsg_cc_name}::from_proto_data)"
-                                        )
-                                        serialize_fn = f"{submsg_cc_name}::as_proto_data"
-                                        submessage_type_obj = f"&{submsg_cc_name}::py_type"
-                                        if field.submessage.map_types is not None:
-                                            key_field, value_field = field.submessage.map_types
-                                            key_type = key_field.data_type.name
-                                            value_type = value_field.data_type.name
-                                            value_enum_ref = (
-                                                f"&{cc_name_for_enum_or_message_info(value_field.enum)}_enum_ref"
-                                                if value_field.enum is not None
-                                                else "nullptr"
-                                            )
-                                            if value_field.submessage is not None:
-                                                value_submsg_name = cc_name_for_enum_or_message_info(
-                                                    value_field.submessage
-                                                )
-                                                value_parse_fn = f"reinterpret_cast<ParseMessageFn>({value_submsg_name}::from_proto_data)"
-                                                value_serialize_fn = f"{value_submsg_name}::as_proto_data"
-                                                value_submessage_type_obj = f"&{value_submsg_name}::py_type"
-
-                                    sub_env = {
-                                        **env,
-                                        "__COMPILER__MESSAGE_FIELD_IS_OPTIONAL__": (
-                                            "true" if field.is_optional else "false"
-                                        ),
-                                        "__COMPILER__MESSAGE_FIELD_NUMBER__": str(field.field_num),
-                                        "__COMPILER__MESSAGE_FIELD_DATA_TYPE__": field.data_type.name,
-                                        "__COMPILER__MESSAGE_FIELD_ENUM_REF__": enum_ref,
-                                        "__COMPILER__MESSAGE_FIELD_SUBMESSAGE_TYPE_OBJ__": submessage_type_obj,
-                                        "__COMPILER__MESSAGE_FIELD_MESSAGE_PARSE_FN__": parse_fn,
-                                        "__COMPILER__MESSAGE_FIELD_MESSAGE_SERIALIZE_FN__": serialize_fn,
-                                        "__COMPILER__MESSAGE_FIELD_KEY_TYPE__": key_type,
-                                        "__COMPILER__MESSAGE_FIELD_VALUE_TYPE__": value_type,
-                                        "__COMPILER__MESSAGE_FIELD_VALUE_ENUM_REF__": value_enum_ref,
-                                        "__COMPILER__MESSAGE_FIELD_VALUE_MESSAGE_PARSE_FN__": value_parse_fn,
-                                        "__COMPILER__MESSAGE_FIELD_VALUE_MESSAGE_SERIALIZE_FN__": value_serialize_fn,
-                                        "__COMPILER__MESSAGE_FIELD_VALUE_SUBMESSAGE_TYPE_OBJ__": value_submessage_type_obj,
-                                    }
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        sub_env,
-                                        (*annotations, f"fld={field.field_num}"),
-                                    )
-
-                            case "__COMPILER__IF_MESSAGE_FIELD_GROUP_IS_NOT_ONEOF__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
-                                assert len(group) > 0
-                                if len(group) == 1:
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        env,
-                                        (*annotations, "ifnot1"),
-                                    )
-                            case "__COMPILER__IF_MESSAGE_FIELD_GROUP_IS_ONEOF__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
-                                assert len(group) > 0
-                                if len(group) > 1:
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        env,
-                                        (*annotations, "if1"),
-                                    )
-                            case "__COMPILER__IF_MESSAGE_FIELD_TYPE_NOT_REPEATED__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
-                                if not field.is_repeated:
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        env,
-                                        (*annotations, "ifnotr"),
-                                    )
-                            case "__COMPILER__IF_MESSAGE_FIELD_TYPE_REPEATED__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
-                                if field.is_repeated and (
-                                    field.submessage is None or field.submessage.map_types is None
-                                ):
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        env,
-                                        (*annotations, "ifr"),
-                                    )
-                            case "__COMPILER__IF_MESSAGE_FIELD_TYPE_MAP__":
-                                mod = self.modules[env["__COMPILER__MODULE_NAME__"]]
-                                message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
-                                field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
-                                if field.submessage is not None and field.submessage.map_types is not None:
-                                    replace_template_scope(
-                                        line_num + 1,
-                                        block_end_line - 1,
-                                        env,
-                                        (*annotations, "ifmap"),
-                                    )
-
-                        line_num = block_end_line
-                        add_line_directive(line_num, annotations)
-                        continue
-
-                    # Replace inline tags with their values from the env
-                    result_line = template_line
-                    inline_tag_m = re_inline_tag.search(result_line)
-                    while inline_tag_m is not None:
-                        tag_start, tag_end = inline_tag_m.span()
-                        try:
-                            result_line = result_line[:tag_start] + env[inline_tag_m.group()] + result_line[tag_end:]
-                        except KeyError:
-                            logging.error(
-                                "Missing key %r at line %d in template %s",
-                                inline_tag_m.group(),
-                                line_num + 1,
-                                template_path,
-                            )
-                            raise
-                        inline_tag_m = re_inline_tag.search(result_line)
-
-                    result_lines.append(result_line)
-                    line_num += 1
-
-            except Exception:
-                logging.error(
-                    "Exception trace: %d in replace_template_scope(%d, %d, %r)",
-                    line_num + 1,
-                    start_line_num + 1,
-                    end_line_num + 1,
-                    env,
-                )
-                raise
-
-        module_env = {
-            "__COMPILER__BASE_MODULE_NAME__": so_module_name.split(".")[-1],
-            "__COMPILER__QUALIFIED_MODULE_NAME__": so_module_name,
+    def cc_source(self, so_module_name: str, add_line_directives: bool = True) -> dict[str, str]:
+        root_env = {
+            "__COMPILER__BASE_OUTPUT_MODULE_NAME__": so_module_name.split(".")[-1],
+            "__COMPILER__QUALIFIED_OUTPUT_MODULE_NAME__": so_module_name,
         }
-        replace_template_scope(0, len(template_lines), module_env, [])
-
-        result = "\n".join(result_lines)
-        assert "__COMPILER__" not in result, "Some __COMPILER__ tags were not replaced"
-        return result
+        ret: dict[str, str] = {
+            f"{so_module_name}.root.cc": TemplateEngine(
+                "pymodule.root.in.cc", self, root_env, add_line_directives=add_line_directives
+            ).run(),
+        }
+        for module_name in self.modules.keys():
+            module_env = {**root_env, "__COMPILER__MODULE_NAME__": module_name}
+            ret[f"{so_module_name}.impl.{module_name}.hh"] = TemplateEngine(
+                "pymodule.impl.in.hh",
+                self,
+                module_env,
+                add_line_directives=add_line_directives,
+                base_annotations=(f"mod={module_name}",),
+            ).run()
+            ret[f"{so_module_name}.impl.{module_name}.cc"] = TemplateEngine(
+                "pymodule.impl.in.cc",
+                self,
+                module_env,
+                add_line_directives=add_line_directives,
+                base_annotations=(f"mod={module_name}",),
+            ).run()
+        return ret
 
     def pyi_source(self) -> str:
         lines = [
@@ -982,7 +894,315 @@ class ModuleCollection:
         return "\n".join(lines)
 
 
-async def get_compiler_args() -> list[str]:
+class TemplateEngine:
+    RE_COMMENT_TAG = re.compile(r"\s*// (?P<tag>__COMPILER__[A-Za-z0-9_]+?__)$")
+    RE_INLINE_TAG = re.compile(r"__COMPILER__[A-Za-z0-9_]+?__")
+
+    def __init__(
+        self,
+        template_filename: str,
+        mod_coll: ModuleCollection,
+        root_env: dict[str, str],
+        add_line_directives: bool = True,
+        base_annotations: Sequence[str] = (),
+    ) -> None:
+        self.template_filename: str = template_filename
+        self.mod_coll: ModuleCollection = mod_coll
+        self.root_env: dict[str, str] = root_env
+        self.add_line_directives: bool = add_line_directives
+        self.base_annotations: Sequence[str] = base_annotations
+        with open(os.path.relpath(os.path.join(os.path.dirname(__file__), template_filename)), "rt") as f:
+            self.template_lines: list[str] = [line.rstrip() for line in f.readlines()]
+        self.result_lines: list[str] = []
+
+    def get_block_end_line(self, start_line_num: int) -> int:
+        line_num = start_line_num
+        block_stack: list[Literal["FOREACH", "IF"]] = []
+        while line_num == start_line_num or len(block_stack) > 0:
+            comment_tag_m = self.RE_COMMENT_TAG.match(self.template_lines[line_num])
+            line_num += 1
+            if comment_tag_m is None:
+                continue
+            tag = comment_tag_m.group("tag")
+            if tag == "__COMPILER__END_IF__":
+                assert len(block_stack) > 0 and block_stack.pop() == "IF", (
+                    f"Unterminated IF block ending at line {start_line_num + 1}"
+                )
+            elif tag == "__COMPILER__END_FOREACH__":
+                assert len(block_stack) > 0 and block_stack.pop() == "FOREACH", (
+                    f"Unterminated FOREACH block ending at line {start_line_num + 1}"
+                )
+            elif tag.startswith("__COMPILER__IF_"):
+                block_stack.append("IF")
+            elif tag.startswith("__COMPILER__FOREACH_"):
+                block_stack.append("FOREACH")
+            else:
+                assert False, f"Invalid comment tag at line {start_line_num + 1}: {tag}"
+        return line_num
+
+    def add_line_directive(self, line_num: int, annotations: Sequence[str]) -> None:
+        if self.add_line_directives:
+            if annotations:
+                annotated_filename = self.template_filename + "(" + ",".join(annotations) + ")"
+            else:
+                annotated_filename = self.template_filename
+            self.result_lines.append(f'#line {line_num + 1} "{annotated_filename}"')
+
+    def replace_template_scope(
+        self, start_line_num: int, end_line_num: int, env: dict[str, str], annotations: Sequence[str] = ()
+    ) -> None:
+        self.add_line_directive(start_line_num, annotations)
+        line_num = start_line_num
+        try:
+            while line_num < end_line_num:
+                template_line = self.template_lines[line_num]
+                comment_tag_m = self.RE_COMMENT_TAG.match(template_line)
+                if comment_tag_m is not None:
+                    tag = comment_tag_m.group("tag")
+                    block_end_line = self.get_block_end_line(line_num)
+                    match tag:
+                        case "__COMPILER__FOREACH_MODULE__":
+                            for mod_name in sorted(self.mod_coll.modules.keys()):
+                                sub_env = {**env, "__COMPILER__MODULE_NAME__": mod_name}
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"mod={mod_name}")
+                                )
+                        case "__COMPILER__FOREACH_ENUM__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            # This ordering is important! We need root objects to appear before their children, so
+                            # e.g. `Message1` appears before `Message1.Submessage1`.
+                            for _, enum in sorted(mod.enums.items()):
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__ENUM_PYTHON_NAME__": enum.name,
+                                    "__COMPILER__ENUM_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(enum.name),
+                                    "__COMPILER__ENUM_CC_NAME__": cc_name_for_enum_or_message_info(enum),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"enum={enum.name}")
+                                )
+                        case "__COMPILER__FOREACH_GLOBAL_ENUM_ALIAS__":
+                            for _, ent in sorted(self.mod_coll.global_aliases.items()):
+                                if ent is None or not isinstance(ent, EnumInfo):
+                                    continue
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__ENUM_PYTHON_NAME__": ent.name,
+                                    "__COMPILER__ENUM_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(ent.name),
+                                    "__COMPILER__ENUM_CC_NAME__": cc_name_for_enum_or_message_info(ent),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"enum={ent.name}")
+                                )
+                        case "__COMPILER__FOREACH_ENUM_MEMBER__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            enum = mod.enums[env["__COMPILER__ENUM_PYTHON_NAME__"]]
+                            for member_name, member_value in sorted(enum.members.items()):
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__ENUM_MEMBER_NAME__": member_name,
+                                    "__COMPILER__ENUM_MEMBER_VALUE__": str(member_value),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"mem={member_name}")
+                                )
+                        case "__COMPILER__FOREACH_MESSAGE__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            # This ordering is important! We need root objects to appear before their children, so e.g.
+                            # `Message1` appears before `Message1.Submessage1`.
+                            for _, message in sorted(mod.messages.items()):
+                                if message.map_types is not None:
+                                    continue
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__MESSAGE_PYTHON_NAME__": message.name,
+                                    "__COMPILER__MESSAGE_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(message.name),
+                                    "__COMPILER__MESSAGE_CC_NAME__": cc_name_for_enum_or_message_info(message),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"msg={message.name}")
+                                )
+                        case "__COMPILER__FOREACH_GLOBAL_MESSAGE_ALIAS__":
+                            for _, ent in sorted(self.mod_coll.global_aliases.items()):
+                                if ent is None or not isinstance(ent, MessageInfo) or ent.map_types is not None:
+                                    continue
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__MESSAGE_PYTHON_NAME__": ent.name,
+                                    "__COMPILER__MESSAGE_PYTHON_NAME_ESCAPED__": cc_name_for_python_name(ent.name),
+                                    "__COMPILER__MESSAGE_CC_NAME__": cc_name_for_enum_or_message_info(ent),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"msg={ent.name}")
+                                )
+                        case "__COMPILER__FOREACH_MESSAGE_FIELD_GROUP__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            # Sort field groups by minimum field number in each group for consistent ordering
+                            sorted_groups = sorted(
+                                message.field_groups.items(), key=lambda item: min(f.field_num for f in item[1])
+                            )
+                            for group_name, fields in sorted_groups:
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__MESSAGE_FIELD_GROUP_NAME__": group_name,
+                                    "__COMPILER__MESSAGE_FIELD_GROUP_DEFAULT_VALUE_CONSTRUCTOR__": default_value_constructor_for_field_group(
+                                        fields
+                                    ),
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1,
+                                    block_end_line - 1,
+                                    sub_env,
+                                    (*annotations, f"grp={group_name}"),
+                                )
+                        case "__COMPILER__FOREACH_MESSAGE_FIELD_IN_GROUP__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
+                            for field in sorted(group, key=lambda f: f.field_num):
+                                enum_ref = "nullptr"
+                                parse_fn = "nullptr"
+                                serialize_fn = "nullptr"
+                                submessage_type_obj = "nullptr"
+                                # These two should only be used within a __COMPILER__IF_MESSAGE_FIELD_TYPE_MAP__,
+                                # so we intentionally use values that won't compile
+                                key_type = "__INVALID__"
+                                value_type = "__INVALID__"
+                                value_enum_ref = "nullptr"
+                                value_parse_fn = "nullptr"
+                                value_serialize_fn = "nullptr"
+                                value_submessage_type_obj = "nullptr"
+
+                                if field.enum is not None:
+                                    enum_ref = f"&{cc_name_for_enum_or_message_info(field.enum)}_enum_ref"
+                                if field.submessage is not None:
+                                    submsg_cc_name = cc_name_for_enum_or_message_info(field.submessage)
+                                    parse_fn = f"reinterpret_cast<ParseMessageFn>({submsg_cc_name}::from_proto_data)"
+                                    serialize_fn = f"{submsg_cc_name}::as_proto_data"
+                                    submessage_type_obj = f"&{submsg_cc_name}::py_type"
+                                    if field.submessage.map_types is not None:
+                                        key_field, value_field = field.submessage.map_types
+                                        key_type = key_field.data_type.name
+                                        value_type = value_field.data_type.name
+                                        value_enum_ref = (
+                                            f"&{cc_name_for_enum_or_message_info(value_field.enum)}_enum_ref"
+                                            if value_field.enum is not None
+                                            else "nullptr"
+                                        )
+                                        if value_field.submessage is not None:
+                                            value_submsg_name = cc_name_for_enum_or_message_info(value_field.submessage)
+                                            value_parse_fn = f"reinterpret_cast<ParseMessageFn>({value_submsg_name}::from_proto_data)"
+                                            value_serialize_fn = f"{value_submsg_name}::as_proto_data"
+                                            value_submessage_type_obj = f"&{value_submsg_name}::py_type"
+
+                                sub_env = {
+                                    **env,
+                                    "__COMPILER__MESSAGE_FIELD_IS_OPTIONAL__": (
+                                        "true" if field.is_optional else "false"
+                                    ),
+                                    "__COMPILER__MESSAGE_FIELD_NUMBER__": str(field.field_num),
+                                    "__COMPILER__MESSAGE_FIELD_DATA_TYPE__": field.data_type.name,
+                                    "__COMPILER__MESSAGE_FIELD_ENUM_REF__": enum_ref,
+                                    "__COMPILER__MESSAGE_FIELD_SUBMESSAGE_TYPE_OBJ__": submessage_type_obj,
+                                    "__COMPILER__MESSAGE_FIELD_MESSAGE_PARSE_FN__": parse_fn,
+                                    "__COMPILER__MESSAGE_FIELD_MESSAGE_SERIALIZE_FN__": serialize_fn,
+                                    "__COMPILER__MESSAGE_FIELD_KEY_TYPE__": key_type,
+                                    "__COMPILER__MESSAGE_FIELD_VALUE_TYPE__": value_type,
+                                    "__COMPILER__MESSAGE_FIELD_VALUE_ENUM_REF__": value_enum_ref,
+                                    "__COMPILER__MESSAGE_FIELD_VALUE_MESSAGE_PARSE_FN__": value_parse_fn,
+                                    "__COMPILER__MESSAGE_FIELD_VALUE_MESSAGE_SERIALIZE_FN__": value_serialize_fn,
+                                    "__COMPILER__MESSAGE_FIELD_VALUE_SUBMESSAGE_TYPE_OBJ__": value_submessage_type_obj,
+                                }
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, sub_env, (*annotations, f"fld={field.field_num}")
+                                )
+
+                        case "__COMPILER__IF_MESSAGE_FIELD_GROUP_IS_NOT_ONEOF__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
+                            assert len(group) > 0
+                            if len(group) == 1:
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, env, (*annotations, "ifnot1")
+                                )
+                        case "__COMPILER__IF_MESSAGE_FIELD_GROUP_IS_ONEOF__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            group = message.field_groups[env["__COMPILER__MESSAGE_FIELD_GROUP_NAME__"]]
+                            assert len(group) > 0
+                            if len(group) > 1:
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, env, (*annotations, "if1")
+                                )
+                        case "__COMPILER__IF_MESSAGE_FIELD_TYPE_NOT_REPEATED__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
+                            if not field.is_repeated:
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, env, (*annotations, "ifnotr")
+                                )
+                        case "__COMPILER__IF_MESSAGE_FIELD_TYPE_REPEATED__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
+                            if field.is_repeated and (field.submessage is None or field.submessage.map_types is None):
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, env, (*annotations, "ifr")
+                                )
+                        case "__COMPILER__IF_MESSAGE_FIELD_TYPE_MAP__":
+                            mod = self.mod_coll.modules[env["__COMPILER__MODULE_NAME__"]]
+                            message = mod.messages[env["__COMPILER__MESSAGE_PYTHON_NAME__"]]
+                            field = message.field_for_number[int(env["__COMPILER__MESSAGE_FIELD_NUMBER__"])]
+                            if field.submessage is not None and field.submessage.map_types is not None:
+                                self.replace_template_scope(
+                                    line_num + 1, block_end_line - 1, env, (*annotations, "ifmap")
+                                )
+
+                    line_num = block_end_line
+                    self.add_line_directive(line_num, annotations)
+                    continue
+
+                # Replace inline tags with their values from the env
+                result_line = template_line
+                inline_tag_m = self.RE_INLINE_TAG.search(result_line)
+                while inline_tag_m is not None:
+                    tag_start, tag_end = inline_tag_m.span()
+                    try:
+                        result_line = result_line[:tag_start] + env[inline_tag_m.group()] + result_line[tag_end:]
+                    except KeyError:
+                        logging.error(
+                            "Missing key %r at line %d in template %s",
+                            inline_tag_m.group(),
+                            line_num + 1,
+                            self.template_filename,
+                        )
+                        raise
+                    inline_tag_m = self.RE_INLINE_TAG.search(result_line)
+
+                self.result_lines.append(result_line)
+                line_num += 1
+
+        except Exception:
+            logging.error(
+                "Exception trace: %d in replace_template_scope(%d, %d, %r)",
+                line_num + 1,
+                start_line_num + 1,
+                end_line_num + 1,
+                env,
+            )
+            raise
+
+    def run(self) -> str:
+        self.replace_template_scope(0, len(self.template_lines), self.root_env, self.base_annotations)
+        result = "\n".join(self.result_lines)
+        assert "__COMPILER__" not in result, f"Some __COMPILER__ tags were not replaced in {self.template_filename}"
+        return result
+
+
+async def get_compiler_args(flags_type: Literal["CFLAGS", "LDFLAGS"]) -> list[str]:
     # Get the actual Python installation directory
     # sysconfig.get_config_var('BINDIR') gives us the real bin directory
     python_bin_dir = sysconfig.get_config_var("BINDIR")
@@ -992,11 +1212,8 @@ async def get_compiler_args() -> list[str]:
 
     python_config = os.path.join(python_bin_dir, "python3-config")
 
-    (cflags, _), (ldflags, _) = await asyncio.gather(
-        check_output_async(python_config, "--cflags"),
-        check_output_async(python_config, "--ldflags"),
-    )
-    ret = [flag.decode("utf-8") for flag in cflags.split() + ldflags.split()]
+    py_flags, _ = await check_output_async(python_config, f"--{flags_type.lower()}")
+    ret = [flag.decode("utf-8") for flag in py_flags.split()]
     ret.append("-std=c++20")
     ret.append("-Wall")
     ret.append("-Wextra")
@@ -1008,17 +1225,20 @@ async def get_compiler_args() -> list[str]:
 
 async def compile_modules(
     output_basename: str,
+    build_dir: str,
     module_names: Iterable[str],
+    descriptor_set_filename: str,
     add_line_directives: bool = True,
     compile_cc: bool = True,
 ) -> None:
     mod_coll = ModuleCollection(modules={})
     for module_name in module_names:
+        print(f"Importing {module_name}")
         mod_coll.add_file(importlib.import_module(module_name).DESCRIPTOR)
     mod_coll.compute_global_aliases()
+    await mod_coll.attach_proto_comments(descriptor_set_filename)
 
     async def write_coll(output_basename: str, mod_coll: ModuleCollection) -> None:
-        cc_filename = output_basename + ".cc"
         pyi_filename = output_basename + ".pyi"
         so_filename = output_basename + ".so"
         so_module_name = output_basename.replace("/", ".")
@@ -1028,87 +1248,114 @@ async def compile_modules(
             f.write(mod_coll.pyi_source())
         print(f"Wrote {pyi_filename}")
 
-        print(f"Generating {cc_filename}")
-        with open(cc_filename, "wt") as f:
-            f.write(mod_coll.cc_source(so_module_name, add_line_directives=add_line_directives))
-        print(f"Wrote {cc_filename}")
+        print("Generating C++ source files")
+        cc_sources = mod_coll.cc_source(so_module_name, add_line_directives=add_line_directives)
+        for cc_filename, cc_source in cc_sources.items():
+            cc_path = os.path.join(build_dir, cc_filename)
+            with open(cc_path, "wt") as f:
+                f.write(cc_source)
+            print(f"Wrote {cc_path}")
 
         if compile_cc:
-            print(f"Compiling {cc_filename} to {so_filename}")
-            py_compiler_args = await get_compiler_args()
-            cmd = ["g++", *py_compiler_args, cc_filename, "-shared", "-o", so_filename]
+            include_dir = os.path.relpath(os.path.dirname(__file__))
+            py_compiler_flags, py_linker_flags = await asyncio.gather(
+                get_compiler_args("CFLAGS"), get_compiler_args("LDFLAGS")
+            )
+
+            num_completed_tasks: int = 0
+
+            async def build_cc_tu(cc_path: str) -> str:
+                nonlocal tasks, num_completed_tasks
+                o_path = cc_path + ".o"
+                print(f"Compiling {cc_path} to {o_path}")
+                cmd = ["g++", *py_compiler_flags, cc_path, "-c", "-I", include_dir, "-I", ".", "-o", o_path]
+                print("... " + " ".join(cmd))
+                await check_call_async(*cmd)
+                num_completed_tasks += 1
+                print(f"Compiled {o_path} ({num_completed_tasks}/{len(tasks)})")
+                return o_path
+
+            tasks: list[asyncio.Task[str]] = [
+                asyncio.create_task(build_cc_tu(os.path.join(include_dir, "pymodule.support.cc"))),
+                *(
+                    asyncio.create_task(build_cc_tu(os.path.join(build_dir, cc_filename)))
+                    for cc_filename in cc_sources.keys()
+                    if not cc_filename.endswith(".hh")
+                ),
+            ]
+            try:
+                o_paths: list[str] = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                raise
+
+            print(f"Linking {so_filename}")
+            cmd = ["g++", *py_linker_flags, "-shared", *o_paths, "-o", so_filename]
             print("... " + " ".join(cmd))
             await check_call_async(*cmd)
-            print(f"Compiled {so_filename}")
+            print(f"Linked {so_filename}")
 
     await write_coll(output_basename, mod_coll)
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("proto_filenames", type=str, nargs="+", help="Names of .proto modules to compile")
     parser.add_argument(
-        "module_names",
-        type=str,
-        nargs="+",
-        help="names of pb2 modules to compile, or paths to .proto files if --proto-files is given",
+        "--no-line-directives", action="store_true", help="Don't generate #line directives in the C++ source"
     )
     parser.add_argument(
-        "--no-line-directives",
-        action="store_true",
-        default=False,
-        help="don't generate #line directives in the C++ source",
+        "--source-only", action="store_true", help="Just generate the .pyi and .cc files; don't compile the .so"
     )
     parser.add_argument(
-        "--source-only",
-        action="store_true",
-        default=False,
-        help="just generate the .pyi and .cc files; don't compile the .so",
+        "--output-basename", type=str, required=True, help="Base filename (without extension) for the generated files"
     )
     parser.add_argument(
-        "--output-basename",
-        type=str,
-        required=True,
-        help="the base filename (without extension) for the generated files",
-    )
-    parser.add_argument(
-        "--proto-files",
-        action="store_true",
-        default=False,
-        help="treat module_names as .proto file paths instead of Python module names",
+        "--retain-intermediates", action="store_true", help="Delete intermediates (.cc/.o files) when build is done"
     )
     args = parser.parse_args()
 
-    if args.proto_files:
-        with tempfile.TemporaryDirectory(dir=".") as temp_dir:
-            tasks: list[Awaitable[Any]] = []
-            temp_module_names: list[str] = []
-            for proto_filename in args.module_names:
-                tasks.append(
-                    check_call_async(
-                        sys.executable,
-                        "-m",
-                        "grpc_tools.protoc",
-                        "-I.",
-                        proto_filename,
-                        f"--python_out={temp_dir}",
-                        f"--pyi_out={temp_dir}",
-                    )
+    build_dir = f"{args.output_basename}.build"
+    try:
+        print(f"Creating build directory {build_dir}")
+        os.makedirs(build_dir, exist_ok=True)
+
+        tasks: list[Awaitable[Any]] = []
+        temp_module_names: list[str] = []
+        descriptor_set_filename: str = f"{build_dir}/__descriptor_set__"
+        for proto_filename in args.proto_filenames:
+            tasks.append(
+                check_call_async(
+                    sys.executable,
+                    "-m",
+                    "grpc_tools.protoc",
+                    "-I.",
+                    "--include_source_info",
+                    "--include_imports",
+                    proto_filename,
+                    f"--python_out={build_dir}",
+                    f"--pyi_out={build_dir}",
+                    f"--descriptor_set_out={descriptor_set_filename}",
                 )
-                temp_module_names.append(f"{os.path.basename(temp_dir)}.{proto_filename.removesuffix('.proto')}_pb2")
-            await asyncio.gather(*tasks)
+            )
+            temp_module_names.append(f"{proto_filename.removesuffix('.proto').replace('/', '.')}_pb2")
+        await asyncio.gather(*tasks)
+
+        with TemporaryImportSearchPath(build_dir):
             await compile_modules(
                 args.output_basename,
+                build_dir,
                 temp_module_names,
+                descriptor_set_filename,
                 add_line_directives=not args.no_line_directives,
                 compile_cc=not args.source_only,
             )
-    else:
-        await compile_modules(
-            args.output_basename,
-            args.module_names,
-            add_line_directives=not args.no_line_directives,
-            compile_cc=not args.source_only,
-        )
+
+    finally:
+        if not args.retain_intermediates:
+            print(f"Deleting build directory {build_dir}")
+            shutil.rmtree(build_dir)
 
 
 def main_sync() -> None:
