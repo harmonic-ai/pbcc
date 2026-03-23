@@ -1574,11 +1574,14 @@ void serialize_oneof_with_tag(StringWriter& w, PyObject* obj, const SerializeOne
 }
 
 // Base case: no types matched (the caller always puts UNKNOWN at the end of
-// the template args)
+// the template args). This happens if the value is unset (None) or if the
+// value's type doesn't match any of the oneof options. In the case where it's
+// None, we should just serialize nothing.
 template <>
-void serialize_oneof_with_tag<DataType::UNKNOWN>(StringWriter&, PyObject*, const SerializeOneofParams*) {
-  // Base case - no types matched
-  throw std::runtime_error("Value for oneof field was not any of the expected types");
+void serialize_oneof_with_tag<DataType::UNKNOWN>(StringWriter&, PyObject* obj, const SerializeOneofParams*) {
+  if (obj != Py_None) {
+    throw std::runtime_error("Value for oneof field was not any of the expected types");
+  }
 }
 
 // Skip a field's data without parsing it

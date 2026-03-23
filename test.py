@@ -198,13 +198,11 @@ def assert_Submessages_default_values(message: Any):
 
 
 def assert_Oneofs_default_values(message: Any):
+    # The default value for a oneof is None (since all subfields are optional)
     assert isinstance(message, pbcc.TestOneofs)
-
-    # The default value for a oneof is the type of the first field in the group
-    assert message.f_int_or_bytes == 0
-    assert message.f_string_or_float == ""
-    assert isinstance(message.f_submessage, pbcc.TestPrimitives)
-    assert_Primitives_default_values(message.f_submessage)
+    assert message.f_int_or_bytes is None
+    assert message.f_string_or_float is None
+    assert message.f_submessage is None
 
 
 def check_field_value(
@@ -1713,8 +1711,10 @@ def test_Oneofs() -> None:
             ("f_int", 500, 500),
             ("f_bytes", b"bights", b"bights"),
             ("f_int", pbcc.TestEnum2.TEST_E2_VALUE3, 1),
+            ("f_int", None, None),
+            ("f_bytes", None, None),
         ),
-        (None, "str", [], {}, pbcc.TestPrimitives()),
+        ("str", [], {}, pbcc.TestPrimitives()),
     )
     check_field_values(
         pb.TestOneofs,
@@ -1724,8 +1724,10 @@ def test_Oneofs() -> None:
             ("f_string", "strong", "strong"),
             ("f_float", 3.0, 3.0),
             ("f_float", pbcc.TestEnum2.TEST_E2_VALUE3, 1.0),
+            ("f_float", None, None),
+            ("f_string", None, None),
         ),
-        (None, b"bytes", [], {}, pbcc.TestOneofs()),
+        (b"bytes", [], {}, pbcc.TestOneofs()),
     )
     check_field_values(
         pb.TestOneofs,
@@ -1747,9 +1749,11 @@ def test_Oneofs() -> None:
                 pbcc.TestOptionalPrimitives(f_sint64=-432),
                 pb.TestOptionalPrimitives(f_sint64=-432),
             ),
+            ("f_primitives", None, None),
+            ("f_list_primitives", None, None),
+            ("f_optional_primitives", None, None),
         ),
         (
-            None,
             1,
             5.0,
             True,

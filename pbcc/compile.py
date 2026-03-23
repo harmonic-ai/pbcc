@@ -447,6 +447,12 @@ class ModuleCollection:
                     )
                 fg.append(fi)
 
+            # All fields in oneofs must be optional
+            for field_group in message.field_groups.values():
+                if len(field_group) >= 2:
+                    for field in field_group:
+                        field.is_optional = True
+
             # Check if this is a map message and populate its type info if so
             if (
                 message.name.endswith("Entry")
