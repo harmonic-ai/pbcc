@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import sysconfig
-import tempfile
 from typing import Any, Awaitable, Iterable, Literal, Sequence, TextIO, cast
 
 from google.protobuf import descriptor_pb2
@@ -1263,6 +1262,7 @@ async def compile_modules(
             )
 
             num_completed_tasks: int = 0
+            tasks: list[asyncio.Task[str]] = []
 
             async def build_cc_tu(cc_path: str) -> str:
                 nonlocal tasks, num_completed_tasks
@@ -1275,7 +1275,7 @@ async def compile_modules(
                 print(f"Compiled {o_path} ({num_completed_tasks}/{len(tasks)})")
                 return o_path
 
-            tasks: list[asyncio.Task[str]] = [
+            tasks = [
                 asyncio.create_task(build_cc_tu(os.path.join(include_dir, "pymodule.support.cc"))),
                 *(
                     asyncio.create_task(build_cc_tu(os.path.join(build_dir, cc_filename)))
