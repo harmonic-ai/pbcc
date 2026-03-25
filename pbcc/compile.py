@@ -1301,18 +1301,25 @@ async def compile_modules(
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("proto_filenames", type=str, nargs="+", help="Names of .proto modules to compile")
+    parser.add_argument("proto_filenames", type=str, nargs="+", help="Names of .proto source files to compile")
     parser.add_argument(
         "--no-line-directives", action="store_true", help="Don't generate #line directives in the C++ source"
     )
     parser.add_argument(
-        "--source-only", action="store_true", help="Just generate the .pyi and .cc files; don't compile the .so"
+        "--source-only",
+        action="store_true",
+        help="Just generate the .pyi file (and .cc files if --retain-intermediates is given); don't compile the .so",
     )
     parser.add_argument(
-        "--output-basename", type=str, required=True, help="Base filename (without extension) for the generated files"
+        "--output-basename",
+        type=str,
+        required=True,
+        help="Base filename (without extension) for the generated .pyi and .so files",
     )
     parser.add_argument(
-        "--retain-intermediates", action="store_true", help="Delete intermediates (.cc/.o files) when build is done"
+        "--retain-intermediates",
+        action="store_true",
+        help="Retain intermediate files (.cc/.o) when the build is complete",
     )
     args = parser.parse_args()
 
