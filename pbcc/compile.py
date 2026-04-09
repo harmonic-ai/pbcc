@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
-from typing import Any, Awaitable, Iterable, Literal, Sequence, TextIO, cast
+from typing import Any, Iterable, Literal, Sequence, TextIO, cast
 
 from google.protobuf import descriptor_pb2
 from google.protobuf.descriptor import Descriptor as MessageDescriptor
@@ -1328,26 +1328,22 @@ async def main() -> None:
         print(f"Creating build directory {build_dir}")
         os.makedirs(build_dir, exist_ok=True)
 
-        tasks: list[Awaitable[Any]] = []
         temp_module_names: list[str] = []
         descriptor_set_filename: str = f"{build_dir}/__descriptor_set__"
+        await check_call_async(
+            sys.executable,
+            "-m",
+            "grpc_tools.protoc",
+            "-I.",
+            "--include_source_info",
+            "--include_imports",
+            *args.proto_filenames,
+            f"--python_out={build_dir}",
+            f"--pyi_out={build_dir}",
+            f"--descriptor_set_out={descriptor_set_filename}",
+        )
         for proto_filename in args.proto_filenames:
-            tasks.append(
-                check_call_async(
-                    sys.executable,
-                    "-m",
-                    "grpc_tools.protoc",
-                    "-I.",
-                    "--include_source_info",
-                    "--include_imports",
-                    proto_filename,
-                    f"--python_out={build_dir}",
-                    f"--pyi_out={build_dir}",
-                    f"--descriptor_set_out={descriptor_set_filename}",
-                )
-            )
             temp_module_names.append(f"{proto_filename.removesuffix('.proto').replace('/', '.')}_pb2")
-        await asyncio.gather(*tasks)
 
         with TemporaryImportSearchPath(build_dir):
             await compile_modules(
