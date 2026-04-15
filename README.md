@@ -22,7 +22,9 @@ message LongMessage {
 }
 ```
 
-To build a file like this, run `uv run -m pbcc.compile my_interface.proto --output-basename my_interface`. This will produce the files my_interface.so (the compiled C++ extension module) and my_interface.pyi (the type annotations for the extension module). If you want to inspect the generated C++ code, you can pass `--retain-intermediates`, which will make pbcc.compile leave behind a directory named my_interface.build containing those files.
+To build a file like this, run `uv run -m pbcc.compile my_interface.proto --output-basename my_interface`. This will produce the files `my_interface.pyi` and a compiled extension module whose suffix comes from the active Python runtime (for example `.so` on many Unix builds or `.pyd` on Windows). If you want to inspect the generated C++ code, you can pass `--retain-intermediates`, which will make pbcc.compile leave behind a directory named `my_interface.build` containing those files.
+
+If your compiler or Python config tool lives somewhere unusual, pbcc also honors `PBCC_CXX`/`CXX` for the compiler, `PYTHON_CONFIG` for the `python-config` executable, and `PBCC_CFLAGS` / `PBCC_LDFLAGS` for additional native build flags.
 
 Here is the resulting pbcc module's interface:
 

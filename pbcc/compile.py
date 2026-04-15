@@ -10,6 +10,7 @@ import importlib
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,83 @@ def normalize_proto_comment(s: str) -> str:
 def normalize_inline_comment(s: str) -> str:
     """Inline comments must be single-line; collapses whitespace/newlines."""
     return " ".join(normalize_proto_comment(s).split())
+
+
+def path_to_module_name(path: str, *, suffix: str | None = None) -> str:
+    """Convert a path-like input into a Python module path.
+
+    This accepts either POSIX or Windows separators so CLI users can pass native
+    paths on any platform.
+    """
+    normalized_path = re.sub(r"[\\/]+", "/", path)
+    if suffix is None:
+        normalized_path = os.path.splitext(normalized_path)[0]
+    elif normalized_path.endswith(suffix):
+        normalized_path = normalized_path[: -len(suffix)]
+
+    while normalized_path.startswith("./"):
+        normalized_path = normalized_path[2:]
+
+    return normalized_path.replace("/", ".")
+
+
+def extension_module_suffix() -> str:
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if isinstance(suffix, str) and suffix:
+        return suffix
+    return ".so"
+
+
+def split_shell_args(args: str | None) -> list[str]:
+    if args is None or not args.strip():
+        return []
+    return shlex.split(args, posix=(os.name != "nt"))
+
+
+def python_config_candidates() -> list[str]:
+    candidates: list[str] = []
+
+    env_python_config = os.environ.get("PYTHON_CONFIG")
+    if env_python_config:
+        candidates.append(env_python_config)
+
+    python_bin_dir = sysconfig.get_config_var("BINDIR")
+    if python_bin_dir is None:
+        python_bin_dir = os.path.dirname(os.path.realpath(sys.executable))
+
+    scripts_dir = os.path.join(sys.prefix, "Scripts")
+    search_dirs = [python_bin_dir]
+    if scripts_dir not in search_dirs:
+        search_dirs.append(scripts_dir)
+
+    candidate_names = (
+        "python3-config",
+        "python-config",
+        "python3-config.exe",
+        "python-config.exe",
+    )
+    for search_dir in search_dirs:
+        for candidate_name in candidate_names:
+            candidate_path = os.path.join(search_dir, candidate_name)
+            if os.path.exists(candidate_path):
+                candidates.append(candidate_path)
+
+    return list(dict.fromkeys(candidates))
+
+
+def cxx_command() -> str:
+    for candidate in (
+        os.environ.get("PBCC_CXX"),
+        os.environ.get("CXX"),
+        shutil.which("g++"),
+        shutil.which("c++"),
+    ):
+        if candidate:
+            return candidate
+
+    raise FileNotFoundError(
+        "No C++ compiler found. Set PBCC_CXX or CXX to a compiler executable, or re-run with --source-only."
+    )
 
 
 async def forward_and_return_data(output: TextIO | None, prefix: str, input: asyncio.StreamReader) -> bytes:
@@ -1202,23 +1280,33 @@ class TemplateEngine:
 
 
 async def get_compiler_args(flags_type: Literal["CFLAGS", "LDFLAGS"]) -> list[str]:
-    # Get the actual Python installation directory
-    # sysconfig.get_config_var('BINDIR') gives us the real bin directory
-    python_bin_dir = sysconfig.get_config_var("BINDIR")
-    if python_bin_dir is None:
-        # Fallback to the directory containing sys.executable
-        python_bin_dir = os.path.dirname(os.path.realpath(sys.executable))
+    ret: list[str] | None = None
+    for python_config in python_config_candidates():
+        try:
+            py_flags, _ = await check_output_async(python_config, f"--{flags_type.lower()}")
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError as exc:
+            logging.warning("Ignoring unusable python-config command %r: %s", python_config, exc)
+            continue
 
-    python_config = os.path.join(python_bin_dir, "python3-config")
+        ret = [flag.decode("utf-8") for flag in py_flags.split()]
+        break
 
-    py_flags, _ = await check_output_async(python_config, f"--{flags_type.lower()}")
-    ret = [flag.decode("utf-8") for flag in py_flags.split()]
-    ret.append("-std=c++20")
-    ret.append("-Wall")
-    ret.append("-Wextra")
-    ret.append("-Werror")
-    ret.append("-Wno-error=missing-field-initializers")
-    ret.append("-fPIC")
+    if ret is None:
+        raise FileNotFoundError(
+            f"Unable to determine Python {flags_type.lower()} flags. "
+            "Set PYTHON_CONFIG to a working python-config executable, or re-run with --source-only."
+        )
+
+    ret.extend(split_shell_args(os.environ.get(f"PBCC_{flags_type}")))
+    if flags_type == "CFLAGS":
+        ret.append("-std=c++20")
+        ret.append("-Wall")
+        ret.append("-Wextra")
+        ret.append("-Werror")
+        ret.append("-Wno-error=missing-field-initializers")
+        ret.append("-fPIC")
     return ret
 
 
@@ -1239,8 +1327,8 @@ async def compile_modules(
 
     async def write_coll(output_basename: str, mod_coll: ModuleCollection) -> None:
         pyi_filename = output_basename + ".pyi"
-        so_filename = output_basename + ".so"
-        so_module_name = output_basename.replace("/", ".")
+        extension_filename = output_basename + extension_module_suffix()
+        extension_module_name = path_to_module_name(output_basename)
 
         print(f"Generating {pyi_filename}")
         with open(pyi_filename, "wt") as f:
@@ -1248,7 +1336,7 @@ async def compile_modules(
         print(f"Wrote {pyi_filename}")
 
         print("Generating C++ source files")
-        cc_sources = mod_coll.cc_source(so_module_name, add_line_directives=add_line_directives)
+        cc_sources = mod_coll.cc_source(extension_module_name, add_line_directives=add_line_directives)
         for cc_filename, cc_source in cc_sources.items():
             cc_path = os.path.join(build_dir, cc_filename)
             with open(cc_path, "wt") as f:
@@ -1257,6 +1345,7 @@ async def compile_modules(
 
         if compile_cc:
             include_dir = os.path.relpath(os.path.dirname(__file__))
+            compiler = cxx_command()
             py_compiler_flags, py_linker_flags = await asyncio.gather(
                 get_compiler_args("CFLAGS"), get_compiler_args("LDFLAGS")
             )
@@ -1268,7 +1357,7 @@ async def compile_modules(
                 nonlocal tasks, num_completed_tasks
                 o_path = cc_path + ".o"
                 print(f"Compiling {cc_path} to {o_path}")
-                cmd = ["g++", *py_compiler_flags, cc_path, "-c", "-I", include_dir, "-I", ".", "-o", o_path]
+                cmd = [compiler, *py_compiler_flags, cc_path, "-c", "-I", include_dir, "-I", ".", "-o", o_path]
                 print("... " + " ".join(cmd))
                 await check_call_async(*cmd)
                 num_completed_tasks += 1
@@ -1290,11 +1379,11 @@ async def compile_modules(
                     task.cancel()
                 raise
 
-            print(f"Linking {so_filename}")
-            cmd = ["g++", *py_linker_flags, "-shared", *o_paths, "-o", so_filename]
+            print(f"Linking {extension_filename}")
+            cmd = [compiler, *py_linker_flags, "-shared", *o_paths, "-o", extension_filename]
             print("... " + " ".join(cmd))
             await check_call_async(*cmd)
-            print(f"Linked {so_filename}")
+            print(f"Linked {extension_filename}")
 
     await write_coll(output_basename, mod_coll)
 
@@ -1308,13 +1397,13 @@ async def main() -> None:
     parser.add_argument(
         "--source-only",
         action="store_true",
-        help="Just generate the .pyi file (and .cc files if --retain-intermediates is given); don't compile the .so",
+        help="Just generate the .pyi file (and .cc files if --retain-intermediates is given); don't compile the extension module",
     )
     parser.add_argument(
         "--output-basename",
         type=str,
         required=True,
-        help="Base filename (without extension) for the generated .pyi and .so files",
+        help="Base filename (without extension) for the generated .pyi and extension module files",
     )
     parser.add_argument(
         "--retain-intermediates",
@@ -1329,7 +1418,7 @@ async def main() -> None:
         os.makedirs(build_dir, exist_ok=True)
 
         temp_module_names: list[str] = []
-        descriptor_set_filename: str = f"{build_dir}/__descriptor_set__"
+        descriptor_set_filename: str = os.path.join(build_dir, "__descriptor_set__")
         await check_call_async(
             sys.executable,
             "-m",
@@ -1343,7 +1432,7 @@ async def main() -> None:
             f"--descriptor_set_out={descriptor_set_filename}",
         )
         for proto_filename in args.proto_filenames:
-            temp_module_names.append(f"{proto_filename.removesuffix('.proto').replace('/', '.')}_pb2")
+            temp_module_names.append(f"{path_to_module_name(proto_filename, suffix='.proto')}_pb2")
 
         with TemporaryImportSearchPath(build_dir):
             await compile_modules(
