@@ -6,6 +6,10 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
+[options]
+exclude-newer = "2026-05-20T20:20:14.198787626Z"
+exclude-newer-span = "P15D"
+
 [[package]]
 name = "grpcio"
 version = "1.76.0"

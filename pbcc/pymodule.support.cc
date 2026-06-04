@@ -16,29 +16,29 @@
 #include "pymodule.support.hh"
 
 void add_object_to_module(PyObject* base_module, const std::string& path, PyObject* obj) {
-  Py_INCREF(obj);
+  Py_INCREF(base_module);
+  PyObjectRef<> parent = base_module;
 
-  PyObject* parent = base_module;
   std::string attr_name = path;
   size_t dot_pos = attr_name.find('.');
   while (dot_pos != std::string::npos) {
     std::string parent_name = attr_name.substr(0, dot_pos);
     attr_name = attr_name.substr(dot_pos + 1);
 
-    PyObject* next_parent = PyObject_GetAttrString(parent, parent_name.c_str());
+    PyObjectRef<> next_parent = PyObject_GetAttrString(parent.borrow(), parent_name.c_str());
     if (!next_parent) {
       throw python_error("");
     }
-    parent = next_parent;
+    parent = std::move(next_parent);
     dot_pos = attr_name.find('.');
   }
 
-  if (PyModule_Check(parent)) {
-    if (PyModule_AddObjectRef(parent, attr_name.c_str(), obj)) {
+  if (PyModule_Check(parent.borrow())) {
+    if (PyModule_AddObjectRef(parent.borrow(), attr_name.c_str(), obj)) {
       throw python_error("");
     }
   } else {
-    if (PyObject_SetAttrString(parent, attr_name.c_str(), obj)) {
+    if (PyObject_SetAttrString(parent.borrow(), attr_name.c_str(), obj)) {
       throw python_error("");
     }
   }
@@ -131,8 +131,10 @@ void PyEnumRef::create_py_enum(const char* qualified_module_name) {
 
   // It seems the enum members can't be pickled because the pickler can't look up which module they're in (it appears
   // as importlib._bootstrap) unless we do this.
-  PyObjectRef<> module_name_str = PyUnicode_FromString(qualified_module_name);
-  PyObject_SetAttrString(local_py_enum.borrow(), "__module__", module_name_str.borrow());
+  PyObjectRef<> module_name_str = raise_python_errors(PyUnicode_FromString, qualified_module_name);
+  if (PyObject_SetAttrString(local_py_enum.borrow(), "__module__", module_name_str.borrow()) == -1) {
+    throw python_error("");
+  }
 
   this->py_enum.assign_ref(local_py_enum.release());
 }
@@ -176,7 +178,9 @@ PyObject* py_dict_value_for_value(PyObject* obj) {
     // compatible with C++. See https://docs.python.org/3/c-api/dict.html#c.PyDict_Next
     while (PyDict_Next(obj, &pos, &key, &value)) {
       PyObjectRef<> new_value = py_dict_value_for_value(value);
-      PyDict_SetItem(ret.borrow(), key, new_value.borrow());
+      if (PyDict_SetItem(ret.borrow(), key, new_value.borrow())) {
+        throw python_error("");
+      }
     }
     return ret.release();
 

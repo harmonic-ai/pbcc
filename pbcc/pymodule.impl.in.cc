@@ -341,8 +341,10 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_setstate(PyObject* py_self, PyObject
   }
 
   auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
-  self->parse_proto_into_this(data, size, false);
-  Py_RETURN_NONE;
+  return handle_python_errors([&]() -> PyObject* {
+    self->parse_proto_into_this(data, size, false);
+    Py_RETURN_NONE;
+  });
 }
 
 void __COMPILER__MESSAGE_CC_NAME__::as_proto_data(PyObject* py_self, StringWriter& w) {
@@ -501,7 +503,7 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_repr(PyObject* py_self) {
     }
     // __COMPILER__END_FOREACH__
     PyObjectRef<> separator = raise_python_errors(PyUnicode_FromString, ", ");
-    PyObjectRef<> args_str = PyUnicode_Join(separator.borrow(), tokens.borrow());
+    PyObjectRef<> args_str = raise_python_errors(PyUnicode_Join, separator.borrow(), tokens.borrow());
     return raise_python_errors(PyUnicode_FromFormat, "__COMPILER__BASE_OUTPUT_MODULE_NAME__.__COMPILER__MODULE_NAME__.__COMPILER__MESSAGE_PYTHON_NAME__(%S)", args_str.borrow());
   });
 }

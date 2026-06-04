@@ -23,9 +23,9 @@ public:
   using runtime_error::runtime_error;
 };
 
-template <typename Func, typename... ArgTs>
-PyObject* raise_python_errors(Func&& func, ArgTs&&... args) {
-  PyObject* ret = std::forward<Func>(func)(std::forward<ArgTs>(args)...);
+template <typename FuncT, typename... ArgTs>
+PyObject* raise_python_errors(FuncT&& func, ArgTs&&... args) {
+  PyObject* ret = std::forward<FuncT>(func)(std::forward<ArgTs>(args)...);
   if (ret == nullptr) {
     throw python_error("");
   }
@@ -616,6 +616,9 @@ inline void encode_varint_signed32(StringWriter& w, int32_t n) {
 inline void encode_varint_signed64(StringWriter& w, int64_t n) {
   encode_varint(w, (n << 1) ^ (n >> 63));
 }
+
+// Skip a field's data without parsing it
+void skip_field(StringReader& r, WireType type);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Field codecs
@@ -1238,7 +1241,6 @@ void parse_map(
     uint64_t tag = decode_varint(sub_r);
     WireType wire_type = wire_type_for_tag(tag);
     uint64_t field_num = field_num_for_tag(tag);
-    // TODO: It'd be nice to store unknown fields due to incorrect types; currently we always raise in such situations
     if (field_num == 1) {
       if (wire_type != wire_type_for_data_type(key_type)) {
         throw_incorrect_type(wire_type_for_data_type(key_type), wire_type);
@@ -1249,6 +1251,9 @@ void parse_map(
         throw_incorrect_type(wire_type_for_data_type(value_type), wire_type);
       }
       value.assign_ref(TypeCodec<value_type>::parse(sub_r, value_enum_ref, value_parse_message, flags));
+    } else {
+      // TODO: It'd be nice to store unknown fields due to incorrect types; currently we ignore them entirely
+      skip_field(sub_r, wire_type);
     }
   }
   // If either the key or value is missing, parse an empty string to construct the default value
@@ -1327,6 +1332,3 @@ void serialize_oneof_with_tag(StringWriter& w, PyObject* obj, const SerializeOne
 // should just serialize nothing.
 template <>
 void serialize_oneof_with_tag<DataType::UNKNOWN>(StringWriter&, PyObject*, const SerializeOneofParams*);
-
-// Skip a field's data without parsing it
-void skip_field(StringReader& r, WireType type);

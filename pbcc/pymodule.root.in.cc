@@ -90,12 +90,9 @@ extern "C" PyMODINIT_FUNC PyInit___COMPILER__BASE_OUTPUT_MODULE_NAME__(void) {
     // __COMPILER__FOREACH_MODULE__
     // __COMPILER__FOREACH_MESSAGE__
     add_object_to_module(m.borrow(), "__COMPILER__MODULE_NAME__.__COMPILER__MESSAGE_PYTHON_NAME_ESCAPED__", reinterpret_cast<PyObject*>(&__COMPILER__MESSAGE_CC_NAME__::py_type));
-    {
-      __COMPILER__MESSAGE_CC_NAME__::py_free_constructor = PyObject_GetAttrString(m.borrow(), "__construct____COMPILER__MESSAGE_CC_NAME__");
-      if (!__COMPILER__MESSAGE_CC_NAME__::py_free_constructor) {
-        throw python_error("");
-      }
-      Py_INCREF(__COMPILER__MESSAGE_CC_NAME__::py_free_constructor);
+    __COMPILER__MESSAGE_CC_NAME__::py_free_constructor = PyObject_GetAttrString(m.borrow(), "__construct____COMPILER__MESSAGE_CC_NAME__");
+    if (!__COMPILER__MESSAGE_CC_NAME__::py_free_constructor) {
+      throw python_error("");
     }
     // __COMPILER__END_FOREACH__
     // __COMPILER__FOREACH_ENUM__
