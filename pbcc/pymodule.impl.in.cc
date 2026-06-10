@@ -282,7 +282,8 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_parse_proto_into_this(PyObject* self
 
   return handle_python_errors([&]() -> PyObject* {
     reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(self)->parse_proto_into_this(input_data, input_size, flags);
-    Py_RETURN_NONE;
+    Py_INCREF(Py_None);
+    return Py_None;
   });
 }
 
@@ -343,7 +344,8 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_setstate(PyObject* py_self, PyObject
   auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   return handle_python_errors([&]() -> PyObject* {
     self->parse_proto_into_this(data, size, false);
-    Py_RETURN_NONE;
+    Py_INCREF(Py_None);
+    return Py_None;
   });
 }
 
@@ -460,15 +462,18 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_as_dict(PyObject* py_self) {
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_delete_unknown_fields(PyObject* py_self) {
   auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   self->data.unknown_fields.clear();
-  Py_RETURN_NONE;
+  Py_INCREF(Py_None);
+  return Py_None;
 }
 
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_has_unknown_fields(PyObject* py_self) {
   auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   if (self->data.unknown_fields.empty()) {
-    Py_RETURN_FALSE;
+    Py_INCREF(Py_False);
+    return Py_False;
   } else {
-    Py_RETURN_TRUE;
+    Py_INCREF(Py_True);
+    return Py_True;
   }
 }
 

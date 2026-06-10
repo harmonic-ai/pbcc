@@ -221,10 +221,12 @@ void encode_varint(StringWriter& w, uint64_t v) {
 }
 
 PyObject* create_py_none() {
-  Py_RETURN_NONE;
+  Py_INCREF(Py_None);
+  return Py_None;
 }
 PyObject* create_py_false() {
-  Py_RETURN_FALSE;
+  Py_INCREF(Py_False);
+  return Py_False;
 }
 PyObject* create_py_int_zero() {
   return raise_python_errors(PyLong_FromLong, 0);
