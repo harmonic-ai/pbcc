@@ -85,6 +85,26 @@ std::string StringReader::preadx(size_t offset, size_t size) const {
   return std::string(reinterpret_cast<const char*>(this->data + offset), size);
 }
 
+void ParseContext::maybe_release_gil() {
+  this->work = 0;
+  if (!this->may_release_gil) {
+    return;
+  }
+  auto now = std::chrono::steady_clock::now();
+  if (this->gil_held_since == std::chrono::steady_clock::time_point()) {
+    this->gil_held_since = now;
+    return;
+  }
+  if (now - this->gil_held_since < MAX_GIL_HOLD) {
+    return;
+  }
+  // If another thread has been waiting for the GIL, it has asked for it by now, and the interpreter hands the GIL to
+  // that thread before this one can take it back
+  Py_BEGIN_ALLOW_THREADS
+  Py_END_ALLOW_THREADS
+  this->gil_held_since = std::chrono::steady_clock::now();
+}
+
 std::string repr(PyObject* obj) {
   PyObjectRef<> repr = raise_python_errors(PyObject_Repr, obj);
   if (!PyUnicode_Check(repr.borrow())) {

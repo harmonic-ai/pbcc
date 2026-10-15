@@ -7,6 +7,9 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -628,7 +631,52 @@ enum ParseFlag {
   IGNORE_INCORRECT_TYPES = 0x02,
 };
 
-using ParseMessageFn = PyObject* (*)(const void* data, size_t size, uint8_t flags);
+// State shared by all levels of one parse call. When allowed, it also lets other threads run during long parses by
+// briefly releasing the GIL once it has been held for a while. To keep this cheap for small messages, the parser only
+// counts approximate work (bytes parsed, plus a fixed amount per field); the clock is read once enough work has piled
+// up, and the GIL is released only once enough time has passed. Bytes in nested messages are counted at every level,
+// which just makes the clock checks a bit more frequent.
+//
+// Releasing the GIL is only safe when no other thread can see the objects being built and the input buffer is pinned
+// and immutable, so callers enable it only for from_proto_data with a read-only buffer. Nothing else may be done
+// while the GIL is released, so the release happens entirely within maybe_release_gil.
+class ParseContext {
+public:
+  // Approximate cost of creating one field's Python object, in the same units as bytes parsed
+  static constexpr size_t WORK_PER_FIELD = 64;
+
+  explicit ParseContext(uint8_t flags, bool may_release_gil = false) : flags(flags), may_release_gil(may_release_gil) {}
+  ParseContext(const ParseContext&) = delete;
+  ParseContext& operator=(const ParseContext&) = delete;
+
+  const uint8_t flags;
+
+  // Called between fields (and between pieces of large values), where no Python state is held mid-update
+  inline void checkpoint(size_t amount) {
+    this->work += amount;
+    if (this->work >= WORK_PER_CLOCK_CHECK) [[unlikely]] {
+      this->maybe_release_gil();
+    }
+  }
+
+private:
+  // About 0.1-0.5ms of decoding, so a clock read costs well under 0.1% of decode time
+  static constexpr size_t WORK_PER_CLOCK_CHECK = 256 * 1024;
+  // This must exceed the interpreter's switch interval (5ms by default). A thread waiting for the GIL only asks for it
+  // after waiting that long without the GIL changing hands; releasing more often than that resets its wait every time
+  // and the waiting thread may never get the GIL at all.
+  static constexpr std::chrono::nanoseconds MAX_GIL_HOLD = std::chrono::milliseconds(10);
+
+  void maybe_release_gil();
+
+  const bool may_release_gil;
+  size_t work = 0;
+  // Unset until the first clock check, so small messages never read the clock; this undercounts the first hold by
+  // one clock check interval at most
+  std::chrono::steady_clock::time_point gil_held_since{};
+};
+
+using ParseMessageFn = PyObject* (*)(const void* data, size_t size, ParseContext& ctx);
 using SerializeMessageFn = void (*)(PyObject* obj, StringWriter&);
 
 [[noreturn]] void throw_incorrect_type(WireType expected_type, WireType received_type);
@@ -657,7 +705,7 @@ struct TypeCodec {
     static_assert(AlwaysFalse<data_type>::v, "Unspecialized TypeCodec::construct_default should never be called");
     return nullptr;
   }
-  static PyObject* parse(StringReader&, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader&, PyEnumRef*, ParseMessageFn, ParseContext&) {
     static_assert(AlwaysFalse<data_type>::v, "Unspecialized TypeCodec::parse should never be called");
     return nullptr;
   }
@@ -674,7 +722,7 @@ struct TypeCodec<DataType::INT32> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLong, static_cast<int32_t>(decode_varint(r)));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -699,7 +747,7 @@ struct TypeCodec<DataType::UINT32> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromUnsignedLong, decode_varint(r));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -722,7 +770,7 @@ struct TypeCodec<DataType::SINT32> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLong, decode_varint_signed(r));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -745,7 +793,7 @@ struct TypeCodec<DataType::INT64> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLongLong, static_cast<int64_t>(decode_varint(r)));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -765,7 +813,7 @@ struct TypeCodec<DataType::UINT64> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromUnsignedLongLong, decode_varint(r));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -785,7 +833,7 @@ struct TypeCodec<DataType::SINT64> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLongLong, decode_varint_signed(r));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -805,7 +853,7 @@ struct TypeCodec<DataType::FIXED32> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromUnsignedLong, r.get_u32l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -828,7 +876,7 @@ struct TypeCodec<DataType::SFIXED32> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLong, r.get_s32l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -851,7 +899,7 @@ struct TypeCodec<DataType::FIXED64> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromUnsignedLongLong, r.get_u64l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -871,7 +919,7 @@ struct TypeCodec<DataType::SFIXED64> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_int_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyLong_FromLongLong, r.get_s64l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -891,7 +939,7 @@ struct TypeCodec<DataType::BOOL> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_false();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyBool_FromLong, decode_varint(r));
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -913,7 +961,7 @@ struct TypeCodec<DataType::FLOAT> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_float_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyFloat_FromDouble, r.get_f32l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -933,7 +981,7 @@ struct TypeCodec<DataType::DOUBLE> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_float_zero();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     return raise_python_errors(PyFloat_FromDouble, r.get_f64l());
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
@@ -953,9 +1001,24 @@ struct TypeCodec<DataType::BYTES> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_empty_bytes();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  // Large values are copied in pieces, so a long copy doesn't hold the GIL throughout
+  static constexpr size_t COPY_PIECE_SIZE = 1024 * 1024;
+
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext& ctx) {
     uint64_t size = decode_varint(r);
-    return raise_python_errors(PyBytes_FromStringAndSize, reinterpret_cast<const char*>(r.getv(size)), size);
+    const char* data = reinterpret_cast<const char*>(r.getv(size));
+    if (size <= COPY_PIECE_SIZE) {
+      return raise_python_errors(PyBytes_FromStringAndSize, data, size);
+    }
+    // The new object isn't visible to any other thread until it's returned, so it can be filled in across checkpoints
+    PyObjectRef<> ret = raise_python_errors(PyBytes_FromStringAndSize, nullptr, size);
+    char* dest = PyBytes_AS_STRING(ret.borrow());
+    for (size_t offset = 0; offset < size; offset += COPY_PIECE_SIZE) {
+      size_t piece_size = std::min<size_t>(COPY_PIECE_SIZE, size - offset);
+      memcpy(dest + offset, data + offset, piece_size);
+      ctx.checkpoint(piece_size);
+    }
+    return ret.release();
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
     char* data;
@@ -976,7 +1039,7 @@ struct TypeCodec<DataType::STRING> {
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn) {
     return create_py_empty_str();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn, ParseContext&) {
     uint64_t size = decode_varint(r);
     return raise_python_errors(PyUnicode_FromStringAndSize, reinterpret_cast<const char*>(r.getv(size)), size);
   }
@@ -1002,7 +1065,7 @@ struct TypeCodec<DataType::ENUM> {
   static PyObject* construct_default(PyEnumRef* enum_ref, ParseMessageFn) {
     return enum_ref->py_member_for_value(0).new_ref();
   }
-  static PyObject* parse(StringReader& r, PyEnumRef* enum_ref, ParseMessageFn, uint8_t) {
+  static PyObject* parse(StringReader& r, PyEnumRef* enum_ref, ParseMessageFn, ParseContext&) {
     if (!enum_ref) {
       throw std::logic_error("Enum definition is missing");
     }
@@ -1030,14 +1093,15 @@ struct TypeCodec<DataType::MESSAGE> {
     }
   }
   static PyObject* construct_default(PyEnumRef*, ParseMessageFn parse) {
-    return parse(nullptr, 0, false);
+    ParseContext ctx(0);
+    return parse(nullptr, 0, ctx);
   }
-  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn parse_message, uint8_t flags) {
+  static PyObject* parse(StringReader& r, PyEnumRef*, ParseMessageFn parse_message, ParseContext& ctx) {
     uint64_t size = decode_varint(r);
     if (!parse_message) {
       throw std::logic_error("Parser not available for submessage");
     }
-    return parse_message(r.getv(size), size, flags);
+    return parse_message(r.getv(size), size, ctx);
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn serialize_message) {
     if (!serialize_message) {
@@ -1091,23 +1155,24 @@ void serialize_with_tag<DataType::MESSAGE>(StringWriter& w, uint64_t field_num, 
 // Repeated field parsing/serializing
 
 template <DataType data_type>
-void parse_packed_repeated(PyObject* list, StringReader& r, PyEnumRef* enum_ref, ParseMessageFn parse_message, uint8_t flags) {
+void parse_packed_repeated(PyObject* list, StringReader& r, PyEnumRef* enum_ref, ParseMessageFn parse_message, ParseContext& ctx) {
   // Get the length, then parse as many items as possible from the following bytes and append them all to the list
   uint64_t size = decode_varint(r);
   StringReader sub_r = r.subx(r.where(), size);
   r.skip(size);
   while (!sub_r.eof()) {
-    PyObjectRef<> v = TypeCodec<data_type>::parse(sub_r, enum_ref, parse_message, flags);
+    PyObjectRef<> v = TypeCodec<data_type>::parse(sub_r, enum_ref, parse_message, ctx);
     if (PyList_Append(list, v.borrow())) {
       throw python_error("");
     }
+    ctx.checkpoint(ParseContext::WORK_PER_FIELD);
   }
 }
 
 template <DataType data_type>
-void parse_unpacked_repeated(PyObject* list, StringReader& r, PyEnumRef* enum_ref, ParseMessageFn parse_message, uint8_t flags) {
+void parse_unpacked_repeated(PyObject* list, StringReader& r, PyEnumRef* enum_ref, ParseMessageFn parse_message, ParseContext& ctx) {
   // Parse a single item and append it to the list
-  PyObjectRef<> v = TypeCodec<data_type>::parse(r, enum_ref, parse_message, flags);
+  PyObjectRef<> v = TypeCodec<data_type>::parse(r, enum_ref, parse_message, ctx);
   if (PyList_Append(list, v.borrow())) {
     throw python_error("");
   }
@@ -1230,7 +1295,7 @@ void parse_map(
     StringReader& r,
     PyEnumRef* value_enum_ref,
     ParseMessageFn value_parse_message,
-    uint8_t flags) {
+    ParseContext& ctx) {
   // We don't bother with "proper" message decoding here, since the key and value types are known and there can only be
   // two fields in the submessage.
   uint64_t size = decode_varint(r);
@@ -1245,12 +1310,12 @@ void parse_map(
       if (wire_type != wire_type_for_data_type(key_type)) {
         throw_incorrect_type(wire_type_for_data_type(key_type), wire_type);
       }
-      key.assign_ref(TypeCodec<key_type>::parse(sub_r, nullptr, nullptr, flags));
+      key.assign_ref(TypeCodec<key_type>::parse(sub_r, nullptr, nullptr, ctx));
     } else if (field_num == 2) {
       if (wire_type != wire_type_for_data_type(value_type)) {
         throw_incorrect_type(wire_type_for_data_type(value_type), wire_type);
       }
-      value.assign_ref(TypeCodec<value_type>::parse(sub_r, value_enum_ref, value_parse_message, flags));
+      value.assign_ref(TypeCodec<value_type>::parse(sub_r, value_enum_ref, value_parse_message, ctx));
     } else {
       // TODO: It'd be nice to store unknown fields due to incorrect types; currently we ignore them entirely
       skip_field(sub_r, wire_type);

@@ -9,7 +9,11 @@ import os
 import pickle
 import subprocess
 import sys
+import threading
+import time
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import FunctionType
 from typing import Any, ClassVar, Protocol, Sequence, cast
 
@@ -2333,6 +2337,84 @@ def test_long_field_repr() -> None:
     # Verify the actual values are preserved
     assert msg.f_string == long_string
     assert msg.f_bytes == long_bytes
+
+
+@contextmanager
+def other_thread_running() -> Iterator[list[float]]:
+    """Runs a thread that records the time whenever it gets to run, until the block exits."""
+    tick_times: list[float] = []
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.is_set():
+            tick_times.append(time.perf_counter())
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=tick)
+    thread.start()
+    try:
+        yield tick_times
+    finally:
+        stop.set()
+        thread.join()
+
+
+@test_case
+def test_parse_large_messages() -> None:
+    # Large enough that the GIL is released several times during the parse, at every level of nesting. Strings use all
+    # three internal str widths, and some bytes values are copied in several pieces.
+    def text(i: int) -> str:
+        return ("ascii line\n", "caf\xe9\n", "\u2200 x \u2192 y\n", "\U0001f600\n")[i % 4] * (i % 300) + str(i)
+
+    primitives = {
+        f"key{i}": pbcc.TestPrimitives(f_string=text(i), f_bytes=bytes([i % 256]) * (i % 1000), f_sint64=-i)
+        for i in range(4_000)
+    }
+    message = pbcc.TestSubmessages(
+        f_primitives=pbcc.TestPrimitives(f_bytes=bytes(range(256)) * (3 * 4096 + 1), f_string=text(299) * 500),
+        f_list_primitives=pbcc.TestListPrimitives(
+            f_int64=list(range(-(2**40), -(2**40) + 300_000)),
+            f_double=[i / 7 for i in range(100_000)],
+            f_string=[text(i) for i in range(2_000)],
+            f_bytes=[b"x" * (1024 * 1024 + 1), b"y" * (1024 * 1024), b""],
+        ),
+        f_maps=pbcc.TestMaps(
+            f_string_string={text(i): text(i + 1) for i in range(4_000)},
+            f_string_bytes={str(i): bytes(i % 2000) for i in range(5_000)},
+            f_string_message={str(i): pbcc.TestPrimitives(f_uint32=i) for i in range(5_000)},
+        ),
+        f_string_primitives=primitives,
+        f_repeated_msg_primitives=list(primitives.values()),
+    )
+    data = message.as_proto_data()
+    print(f"... {len(data)} bytes")
+
+    with other_thread_running():
+        for input_data in (data, memoryview(data), bytearray(data)):
+            assert pbcc.TestSubmessages.from_proto_data(input_data) == message
+
+    # Same result as Google's library, in both directions
+    pb_message = pb.TestSubmessages.FromString(data)
+    assert pb_message.f_maps.f_string_string == message.f_maps.f_string_string
+    assert pbcc.TestSubmessages.from_proto_data(pb_message.SerializeToString()) == message
+
+    # Errors near the end of a large message are still reported
+    assert_parsing_fails(pbcc.TestSubmessages, data[:-1])
+
+
+@test_case
+def test_parse_lets_other_threads_run() -> None:
+    # A parse this long (well over 100ms) should let another thread run many times; holding the GIL throughout would
+    # let it run at most once just before and once just after the parse
+    data = pbcc.TestMaps(f_string_string={f"key{i}": f"value{i}" for i in range(600_000)}).as_proto_data()
+    with other_thread_running() as tick_times:
+        start = time.perf_counter()
+        message = pbcc.TestMaps.from_proto_data(data)
+        end = time.perf_counter()
+    ticks = sum(start < t < end for t in tick_times)
+    print(f"... parse took {(end - start) * 1000:.0f}ms; the other thread ran {ticks} times during it")
+    assert len(message.f_string_string) == 600_000
+    assert ticks >= 3, ticks
 
 
 def run_all_tests() -> int:
