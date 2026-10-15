@@ -61,10 +61,10 @@ struct __COMPILER__MESSAGE_CC_NAME__ {
   static PyObject* py_proto_copy(PyObject* self, PyObject* args, PyObject* kwargs);
 
   // Protobuf parsing/serializing functions
-  void parse_unknown_field(StringReader& r, uint64_t tag, uint8_t flags);
-  void handle_incorrect_type(StringReader& r, uint64_t tag, DataType expected_type, uint8_t flags);
-  void parse_proto_into_this(const void* data, size_t size, uint8_t flags);
-  static __COMPILER__MESSAGE_CC_NAME__* from_proto_data(const void* data, size_t size, uint8_t flags);
+  void parse_unknown_field(StringReader& r, uint64_t tag, ParseContext& ctx);
+  void handle_incorrect_type(StringReader& r, uint64_t tag, DataType expected_type, ParseContext& ctx);
+  void parse_proto_into_this(const void* data, size_t size, ParseContext& ctx);
+  static __COMPILER__MESSAGE_CC_NAME__* from_proto_data(const void* data, size_t size, ParseContext& ctx);
   static PyObject* py_parse_proto_into_this(PyObject* self, PyObject* args, PyObject* kwargs);
   static PyObject* py_from_proto_data(PyObject* self, PyObject* args, PyObject* kwargs);
   static void as_proto_data(PyObject* py_self, StringWriter& w);

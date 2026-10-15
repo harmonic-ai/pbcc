@@ -156,8 +156,8 @@ void __COMPILER__MESSAGE_CC_NAME__::py_dealloc(PyObject* py_self) {
   Py_TYPE(self)->tp_free(self);
 }
 
-void __COMPILER__MESSAGE_CC_NAME__::parse_unknown_field(StringReader& r, uint64_t tag, uint8_t flags) {
-  if (flags & ParseFlag::RETAIN_UNKNOWN_FIELDS) {
+void __COMPILER__MESSAGE_CC_NAME__::parse_unknown_field(StringReader& r, uint64_t tag, ParseContext& ctx) {
+  if (ctx.flags & ParseFlag::RETAIN_UNKNOWN_FIELDS) {
     size_t start_offset = r.where();
     skip_field(r, wire_type_for_tag(tag));
     this->data.unknown_fields.emplace(tag, r.preadx(start_offset, r.where() - start_offset));
@@ -167,17 +167,18 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_unknown_field(StringReader& r, uint64_
 }
 
 void __COMPILER__MESSAGE_CC_NAME__::handle_incorrect_type(
-    StringReader& r, uint64_t tag, DataType expected_type, uint8_t flags) {
-  if (!(flags & ParseFlag::IGNORE_INCORRECT_TYPES)) {
+    StringReader& r, uint64_t tag, DataType expected_type, ParseContext& ctx) {
+  if (!(ctx.flags & ParseFlag::IGNORE_INCORRECT_TYPES)) {
     throw_incorrect_type(wire_type_for_data_type(expected_type), wire_type_for_tag(tag));
   } else {
-    this->parse_unknown_field(r, tag, flags);
+    this->parse_unknown_field(r, tag, ctx);
   }
 }
 
-void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size_t size, uint8_t flags) {
+void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size_t size, ParseContext& ctx) {
   StringReader r(data, size);
   while (!r.eof()) {
+    size_t field_start = r.where();
     uint64_t tag = decode_varint(r);
     WireType received_type = wire_type_for_tag(tag);
     switch (field_num_for_tag(tag)) {
@@ -192,9 +193,9 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
                     r,
                     __COMPILER__MESSAGE_FIELD_ENUM_REF__,
                     __COMPILER__MESSAGE_FIELD_MESSAGE_PARSE_FN__,
-                    flags));
+                    ctx));
           } else {
-            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, flags);
+            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, ctx);
           }
           // __COMPILER__END_IF__
           // __COMPILER__IF_MESSAGE_FIELD_TYPE_REPEATED__
@@ -205,16 +206,16 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
                 r,
                 __COMPILER__MESSAGE_FIELD_ENUM_REF__,
                 __COMPILER__MESSAGE_FIELD_MESSAGE_PARSE_FN__,
-                flags);
+                ctx);
           } else if (received_type == wire_type_for_data_type(DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__)) {
             parse_unpacked_repeated<DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__>(
                 this->data.py___COMPILER__MESSAGE_FIELD_GROUP_NAME__.borrow(),
                 r,
                 __COMPILER__MESSAGE_FIELD_ENUM_REF__,
                 __COMPILER__MESSAGE_FIELD_MESSAGE_PARSE_FN__,
-                flags);
+                ctx);
           } else {
-            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, flags);
+            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, ctx);
           }
           // __COMPILER__END_IF__
           // __COMPILER__IF_MESSAGE_FIELD_TYPE_MAP__
@@ -226,9 +227,9 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
                 r,
                 __COMPILER__MESSAGE_FIELD_VALUE_ENUM_REF__,
                 __COMPILER__MESSAGE_FIELD_VALUE_MESSAGE_PARSE_FN__,
-                flags);
+                ctx);
           } else {
-            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, flags);
+            this->handle_incorrect_type(r, tag, DataType::__COMPILER__MESSAGE_FIELD_DATA_TYPE__, ctx);
           }
           // __COMPILER__END_IF__
         } catch (const python_error& e) {
@@ -245,7 +246,7 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
         // __COMPILER__END_FOREACH__
       default:
         try {
-          this->parse_unknown_field(r, tag, flags);
+          this->parse_unknown_field(r, tag, ctx);
         } catch (const python_error& e) {
           auto prefix = string_printf("(at 0x%zX) ", r.where());
           throw python_error(prefix + e.what());
@@ -254,6 +255,7 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
           throw std::runtime_error(prefix + e.what());
         }
     }
+    ctx.checkpoint(r.where() - field_start + ParseContext::WORK_PER_FIELD);
   }
 }
 
@@ -281,17 +283,19 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_parse_proto_into_this(PyObject* self
       (ignore_incorrect_types ? ParseFlag::IGNORE_INCORRECT_TYPES : 0));
 
   return handle_python_errors([&]() -> PyObject* {
-    reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(self)->parse_proto_into_this(input_data, input_size, flags);
+    // The GIL is never released here: other threads can see (and modify) this object while it's being parsed into
+    ParseContext ctx(flags);
+    reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(self)->parse_proto_into_this(input_data, input_size, ctx);
     Py_INCREF(Py_None);
     return Py_None;
   });
 }
 
 __COMPILER__MESSAGE_CC_NAME__* __COMPILER__MESSAGE_CC_NAME__::from_proto_data(
-    const void* data, size_t size, uint8_t flags) {
+    const void* data, size_t size, ParseContext& ctx) {
   PyObjectRef<__COMPILER__MESSAGE_CC_NAME__> self = __COMPILER__MESSAGE_CC_NAME__::new_with_default_values(
       &__COMPILER__MESSAGE_CC_NAME__::py_type);
-  self->parse_proto_into_this(data, size, flags);
+  self->parse_proto_into_this(data, size, ctx);
   return self.release();
 }
 
@@ -299,17 +303,17 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_from_proto_data(PyObject*, PyObject*
   static const char* kwarg_names[] = {"data", "retain_unknown_fields", "ignore_incorrect_types", nullptr};
   static char** kwarg_names_arg = const_cast<char**>(kwarg_names);
 
-  const void* input_data;
-  Py_ssize_t input_size;
+  // The input buffer stays exported (so it can't be resized or freed) for the whole parse, since the GIL may be
+  // released during it
+  Py_buffer input;
   int retain_unknown_fields = 1;
   int ignore_incorrect_types = 0;
   if (!PyArg_ParseTupleAndKeywords(
           args,
           kwargs,
-          "y#|pp",
+          "y*|pp",
           kwarg_names_arg,
-          &input_data,
-          &input_size,
+          &input,
           &retain_unknown_fields,
           &ignore_incorrect_types)) {
     return nullptr;
@@ -318,7 +322,12 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_from_proto_data(PyObject*, PyObject*
   uint8_t flags = ((retain_unknown_fields ? ParseFlag::RETAIN_UNKNOWN_FIELDS : 0) |
       (ignore_incorrect_types ? ParseFlag::IGNORE_INCORRECT_TYPES : 0));
 
-  return handle_python_errors(__COMPILER__MESSAGE_CC_NAME__::from_proto_data, input_data, input_size, flags);
+  // The new object isn't visible to other threads until it's returned, so the GIL can be released while parsing, as
+  // long as other threads can't modify the input in the meantime
+  ParseContext ctx(flags, input.readonly);
+  PyObject* ret = handle_python_errors(__COMPILER__MESSAGE_CC_NAME__::from_proto_data, input.buf, input.len, ctx);
+  PyBuffer_Release(&input);
+  return ret;
 }
 
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_reduce(PyObject* py_self) {
@@ -343,7 +352,8 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_setstate(PyObject* py_self, PyObject
 
   auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   return handle_python_errors([&]() -> PyObject* {
-    self->parse_proto_into_this(data, size, false);
+    ParseContext ctx(0);
+    self->parse_proto_into_this(data, size, ctx);
     Py_INCREF(Py_None);
     return Py_None;
   });
