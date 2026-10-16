@@ -2335,6 +2335,17 @@ def test_long_field_repr() -> None:
     assert msg.f_bytes == long_bytes
 
 
+@test_case
+def test_serialize_does_not_cache_utf8() -> None:
+    s = "caf\u00e9 \u2200 \U0001f600 " * 1000
+    size_before = sys.getsizeof(s)
+    msg = pbcc.TestPrimitives(f_string=s)
+    data = msg.as_proto_data()
+    assert sys.getsizeof(s) == size_before, (size_before, sys.getsizeof(s))
+    assert data == pb.TestPrimitives(f_string=s).SerializeToString()
+    assert pbcc.TestPrimitives.from_proto_data(data).f_string == s
+
+
 def run_all_tests() -> int:
     num_failures: int = 0
     for name, fn in ALL_TEST_CASES:

@@ -981,13 +981,17 @@ struct TypeCodec<DataType::STRING> {
     return raise_python_errors(PyUnicode_FromStringAndSize, reinterpret_cast<const char*>(r.getv(size)), size);
   }
   static void serialize_without_tag(StringWriter& w, PyObject* obj, PyEnumRef*, SerializeMessageFn) {
-    ssize_t size;
-    const char* data = PyUnicode_AsUTF8AndSize(obj, &size);
-    if (!data) {
-      throw python_error("");
+    // Avoid PyUnicode_AsUTF8AndSize, which caches the UTF-8 encoding on non-ASCII str objects
+    if (PyUnicode_IS_COMPACT_ASCII(obj)) {
+      ssize_t size = PyUnicode_GET_LENGTH(obj);
+      encode_varint(w, size);
+      w.write(PyUnicode_DATA(obj), size);
+      return;
     }
+    PyObjectRef<> encoded = raise_python_errors(PyUnicode_AsUTF8String, obj);
+    ssize_t size = PyBytes_GET_SIZE(encoded.borrow());
     encode_varint(w, size);
-    w.write(data, size);
+    w.write(PyBytes_AS_STRING(encoded.borrow()), size);
   }
 };
 
