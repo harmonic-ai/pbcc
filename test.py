@@ -388,24 +388,28 @@ def test_subclasses_and_references() -> None:
         def __repr__(self) -> str:
             return "CountedPrimitives+" + pbcc.TestPrimitives.__repr__(self)
 
+    # What sys.getrefcount returns for an object referenced only by one local
+    # variable. Before Python 3.14 this is 2 (the variable, plus the temporary
+    # reference passed to sys.getrefcount); from 3.14 on, the interpreter can
+    # pass a borrowed reference instead, so it may be 1.
+    single_ref = object()
+    single_refcount = sys.getrefcount(single_ref)
+
     message = CountedPrimitives()
     assert CountedPrimitives.total_count == 1
     assert_Primitives_default_values(message)
-
-    # The message variable is 1 reference, the temporary reference passed to
-    # sys.getrefcount is the other
-    assert sys.getrefcount(message) == 2
+    assert sys.getrefcount(message) == single_refcount
 
     del message
     assert CountedPrimitives.total_count == 0
 
     message = CountedPrimitives(f_sint32=24)
     assert CountedPrimitives.total_count == 1
-    assert sys.getrefcount(message) == 2
+    assert sys.getrefcount(message) == single_refcount
     oneofs = pbcc.TestOneofs(f_submessage=message)
     assert oneofs.f_submessage is message
-    assert sys.getrefcount(oneofs) == 2
-    assert sys.getrefcount(message) == 3
+    assert sys.getrefcount(oneofs) == single_refcount
+    assert sys.getrefcount(message) == single_refcount + 1
     del message
     assert CountedPrimitives.total_count == 1
     del oneofs
