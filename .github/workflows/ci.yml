@@ -34,4 +34,6 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y g++
     
     - name: Run tests
-      run: uv run --python ${{ matrix.python-version }} test.py
+      run: |
+        uv run --python ${{ matrix.python-version }} python test_compile_helpers.py
+        uv run --python ${{ matrix.python-version }} test.py
