@@ -23,7 +23,7 @@
 
 // __COMPILER__FOREACH_ENUM__
 const char* __COMPILER__ENUM_CC_NAME__EnumRef::get_python_name() const {
-  return "__COMPILER__MODULE_NAME__.__COMPILER__ENUM_PYTHON_NAME__";
+  return "__COMPILER__MODULE_NAME__.__COMPILER__ENUM_PYTHON_NAME_ESCAPED__";
 }
 
 void __COMPILER__ENUM_CC_NAME__EnumRef::populate_values(PyObject* dict) {
@@ -64,7 +64,7 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_new(PyTypeObject* type, PyObject*, P
 }
 
 int __COMPILER__MESSAGE_CC_NAME__::py_init(PyObject* py_self, PyObject* args, PyObject* kwargs) {
-  __COMPILER__MESSAGE_CC_NAME__* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
+  [[maybe_unused]] __COMPILER__MESSAGE_CC_NAME__* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   static const char* kwarg_names[] = {
       // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__
       "__COMPILER__MESSAGE_FIELD_GROUP_NAME__",
@@ -101,7 +101,7 @@ int __COMPILER__MESSAGE_CC_NAME__::py_init(PyObject* py_self, PyObject* args, Py
 }
 
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_proto_copy(PyObject* py_self, PyObject* args, PyObject* kwargs) {
-  __COMPILER__MESSAGE_CC_NAME__* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
+  [[maybe_unused]] __COMPILER__MESSAGE_CC_NAME__* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   static const char* kwarg_names[] = {
       // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__
       "__COMPILER__MESSAGE_FIELD_GROUP_NAME__",
@@ -179,7 +179,7 @@ void __COMPILER__MESSAGE_CC_NAME__::parse_proto_into_this(const void* data, size
   StringReader r(data, size);
   while (!r.eof()) {
     uint64_t tag = decode_varint(r);
-    WireType received_type = wire_type_for_tag(tag);
+    [[maybe_unused]] WireType received_type = wire_type_for_tag(tag);
     switch (field_num_for_tag(tag)) {
       // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__
       // __COMPILER__FOREACH_MESSAGE_FIELD_IN_GROUP__
@@ -446,7 +446,7 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_as_proto_data(PyObject* py_self) {
 }
 
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_as_dict(PyObject* py_self) {
-  auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
+  [[maybe_unused]] auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   return handle_python_errors([&]() -> PyObject* {
     PyObjectRef<> dict = raise_python_errors(PyDict_New);
     // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__
@@ -478,7 +478,7 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_has_unknown_fields(PyObject* py_self
 }
 
 PyObject* __COMPILER__MESSAGE_CC_NAME__::py_repr(PyObject* py_self) {
-  auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
+  [[maybe_unused]] auto* self = reinterpret_cast<__COMPILER__MESSAGE_CC_NAME__*>(py_self);
   return handle_python_errors([&]() -> PyObject* {
     PyObjectRef<> tokens = raise_python_errors(PyList_New, 0);
     // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__
@@ -526,8 +526,8 @@ PyObject* __COMPILER__MESSAGE_CC_NAME__::py_richcompare(PyObject* py_self, PyObj
     return ret;
   }
 
-  const auto* self = reinterpret_cast<const __COMPILER__MESSAGE_CC_NAME__*>(py_self);
-  const auto* other = reinterpret_cast<const __COMPILER__MESSAGE_CC_NAME__*>(py_other);
+  [[maybe_unused]] const auto* self = reinterpret_cast<const __COMPILER__MESSAGE_CC_NAME__*>(py_self);
+  [[maybe_unused]] const auto* other = reinterpret_cast<const __COMPILER__MESSAGE_CC_NAME__*>(py_other);
 
   // Compare each field one by one, recursively
   // __COMPILER__FOREACH_MESSAGE_FIELD_GROUP__

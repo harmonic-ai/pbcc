@@ -71,7 +71,8 @@ class PBCCMessage(Protocol):
 #     + Maps (value types all of the above, key types primitive only)
 #     + Submessages
 #   + str() and repr() do reasonable things
-# - Nested message declarations
+# + Nested message and enum declarations
+# + Messages with no fields
 # + Deserializing invalid data (is StringReader out_of_range handled properly?)
 # + Ensure all of the above is cross-compatible with the Google libs (serialize with pbcc and deserialize with Google, and vice versa)
 # + Refcounts, somehow
@@ -2348,6 +2349,206 @@ def test_serialize_does_not_cache_utf8() -> None:
     assert sys.getsizeof(s) == size_before, (size_before, sys.getsizeof(s))
     assert data == pb.TestPrimitives(f_string=s).SerializeToString()
     assert pbcc.TestPrimitives.from_proto_data(data).f_string == s
+
+
+@test_case
+def test_nested_enums() -> None:
+    Kind = pbcc.TestNested_Kind
+    Color = pbcc.TestNested_Inner_Color
+
+    # Nested types are exposed under underscore-joined names, both in the per-file namespace and as global aliases
+    assert pbcc.test.TestNested_Kind is Kind
+    assert pbcc.test.TestNested_Inner_Color is Color
+    assert pbcc.test.TestNested_Inner is pbcc.TestNested_Inner
+    assert {m.name: m.value for m in Kind} == {"KIND_UNKNOWN": 0, "KIND_A": 1, "KIND_B": -2}
+    assert {m.name: m.value for m in Color} == {"COLOR_RED": 0, "COLOR_GREEN": 7}
+
+    # Enum members (and messages containing them) must survive pickling, which requires the enum's qualified name to
+    # be resolvable from the module
+    for member in (*Kind, *Color):
+        assert pickle.loads(pickle.dumps(member)) is member
+
+    m = pbcc.TestNested()
+    assert m.f_kind == Kind.KIND_UNKNOWN
+    assert m.f_kinds == []
+    assert m.f_maybe_kind is None
+    assert m.f_inner == pbcc.TestNested_Inner()
+    assert m.f_inner.f_color == Color.COLOR_RED
+    assert m.f_string_kind == {}
+    assert m.f_kind_or_string is None
+    assert m.as_proto_data() == b""
+    assert pbcc.TestNested.from_proto_data(b"") == m
+
+    wrong_types_for_kind: tuple[Any, ...] = (
+        None,
+        "str",
+        b"bytes",
+        [],
+        {},
+        0,
+        pbcc.TestEnum1.TEST_E1_VALUE1,
+        Color.COLOR_RED,
+        pbcc.TestNested_Inner(),
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_kind",
+        (
+            (Kind.KIND_UNKNOWN, pb.TestNested.KIND_UNKNOWN),
+            (Kind.KIND_A, pb.TestNested.KIND_A),
+            (Kind.KIND_B, pb.TestNested.KIND_B),
+        ),
+        wrong_types_for_kind,
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_kinds",
+        (
+            ([], []),
+            ([Kind.KIND_A], [pb.TestNested.KIND_A]),
+            ([Kind.KIND_B, Kind.KIND_UNKNOWN, Kind.KIND_A], [pb.TestNested.KIND_B, 0, pb.TestNested.KIND_A]),
+        ),
+        ([Color.COLOR_GREEN], [0], [None], "str"),
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_maybe_kind",
+        (
+            (None, None),
+            (Kind.KIND_UNKNOWN, pb.TestNested.KIND_UNKNOWN),
+            (Kind.KIND_B, pb.TestNested.KIND_B),
+        ),
+        (Color.COLOR_GREEN, 1, "str"),
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_inner",
+        (
+            (
+                pbcc.TestNested_Inner(f_color=Color.COLOR_GREEN, f_kind=Kind.KIND_B),
+                pb.TestNested.Inner(f_color=pb.TestNested.Inner.COLOR_GREEN, f_kind=pb.TestNested.KIND_B),
+            ),
+        ),
+        (pbcc.TestNested_Inner(f_color=Kind.KIND_A), pbcc.TestEmpty(), 1),  # type: ignore
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_string_kind",
+        (
+            ({}, {}),
+            ({"a": Kind.KIND_A}, {"a": pb.TestNested.KIND_A}),
+            ({"b": Kind.KIND_B}, {"b": pb.TestNested.KIND_B}),
+        ),
+        ({"a": Color.COLOR_GREEN}, {"a": 1}, {1: Kind.KIND_A}),
+    )
+    check_field_values(
+        pb.TestNested,
+        pbcc.TestNested,
+        "f_kind_or_string",
+        (
+            ("f_oneof_color", Color.COLOR_GREEN, pb.TestNested.Inner.COLOR_GREEN),
+            ("f_oneof_string", "strung", "strung"),
+            ("f_oneof_color", None, None),
+        ),
+        (Kind.KIND_A, b"bytes", 7),
+    )
+
+    # Nested types can be referenced from other messages
+    m_cc = pbcc.TestNestedReferences(
+        f_kind=Kind.KIND_B,
+        f_color=Color.COLOR_GREEN,
+        f_inner=pbcc.TestNested_Inner(f_kind=Kind.KIND_A),
+    )
+    m_pb = pb.TestNestedReferences(
+        f_kind=pb.TestNested.KIND_B,
+        f_color=pb.TestNested.Inner.COLOR_GREEN,
+        f_inner=pb.TestNested.Inner(f_kind=pb.TestNested.KIND_A),
+    )
+    assert m_cc.as_proto_data() == m_pb.SerializeToString()
+    assert pbcc.TestNestedReferences.from_proto_data(m_pb.SerializeToString()) == m_cc
+    assert pickle.loads(pickle.dumps(m_cc)) == m_cc
+    assert m_cc.as_dict()["f_inner"] == {"f_color": Color.COLOR_RED, "f_kind": Kind.KIND_A}
+
+    # Unknown nested enum values are rejected when parsing, as for top-level enums
+    assert_parsing_fails(pbcc.TestNested, bytes.fromhex("0803"), "Enum member 3 does not exist")
+
+
+@test_case
+def test_empty_message() -> None:
+    m = pbcc.TestEmpty()
+    assert m.as_proto_data() == b""
+    assert m.as_dict() == {}
+    assert m == pbcc.TestEmpty.from_proto_data(b"")
+    assert m.proto_copy() == m
+    assert pickle.loads(pickle.dumps(m)) == m
+    assert repr(m) == "test_pbcc.test.TestEmpty()", repr(m)
+    assert not m.has_unknown_fields()
+
+    # Every field is unknown to an empty message, so all of them are retained and passed through
+    m_pb = pb.TestPrimitives(f_int32=7, f_string="seven")
+    data = m_pb.SerializeToString()
+    m = pbcc.TestEmpty.from_proto_data(data)
+    assert m.has_unknown_fields()
+    assert pb.TestPrimitives.FromString(m.as_proto_data()) == m_pb
+    m.delete_unknown_fields()
+    assert m.as_proto_data() == b""
+    assert not pbcc.TestEmpty.from_proto_data(data, retain_unknown_fields=False).has_unknown_fields()
+
+    # Empty messages as submessages: presence of an optional or repeated empty message is encoded as a zero-length
+    # field, the same way Google's library does it
+    m_cc = pbcc.TestNestedReferences(f_empty=pbcc.TestEmpty(), f_empties=[pbcc.TestEmpty(), pbcc.TestEmpty()])
+    m_pb = pb.TestNestedReferences(f_empty=pb.TestEmpty(), f_empties=[pb.TestEmpty(), pb.TestEmpty()])
+    assert m_cc.as_proto_data() == m_pb.SerializeToString()
+    m_cc2 = pbcc.TestNestedReferences.from_proto_data(m_pb.SerializeToString())
+    assert m_cc2 == m_cc
+    assert len(m_cc2.f_empties) == 2
+    assert pbcc.TestNestedReferences().f_empty is None
+
+
+@test_case
+def test_pyi_is_valid_python() -> None:
+    # The generated type stubs must parse, including for nested types and messages with no fields
+    import ast
+
+    with open("test_modules/test_pbcc.pyi") as f:
+        pyi_source = f.read()
+    tree = ast.parse(pyi_source)
+    classes = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    for name in ("TestNested", "TestNested_Inner", "TestNested_Kind", "TestNested_Inner_Color", "TestEmpty"):
+        assert name in classes, name
+    assert ast.get_docstring(classes["TestNested_Kind"]) == (
+        "This is a nested enum comment. It should be attached to TestNested_Kind."
+    )
+    assert "This is a nested enum value comment." in pyi_source
+
+
+@test_case
+def test_nested_name_collision_is_rejected() -> None:
+    # Outer.Inner and Outer_Inner would both be exposed as Outer_Inner, so pbcc should refuse to compile this
+    os.makedirs("test_modules/collision", exist_ok=True)
+    proto_filename = "test_modules/collision/collision.proto"
+    with open(proto_filename, "w") as f:
+        f.write('syntax = "proto3";\nmessage Outer { enum Inner { A = 0; } }\nmessage Outer_Inner { int32 x = 1; }\n')
+    result = subprocess.run(
+        (
+            sys.executable,
+            "pbcc/compile.py",
+            proto_filename,
+            "--source-only",
+            "--output-basename",
+            "test_modules/collision/collision_pbcc",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "would both be named Outer_Inner" in result.stderr, result.stderr
 
 
 def run_all_tests() -> int:
