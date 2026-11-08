@@ -526,19 +526,34 @@ def extract_enum_comment_maps_from_descriptor_set(
 
         file_enum_comments: dict[str, EnumComments] = {}
 
-        # Top-level enums: FileDescriptorProto.enum_type = 5
-        for i, enum_desc in enumerate(fd.enum_type):
-            enum_name = enum_desc.name  # no package; nested enums not supported by this compiler
-            enum_comment = comment_for_path([5, i])
+        def walk_enum(enum_desc: descriptor_pb2.EnumDescriptorProto, prefix: str, base_path: list[int]) -> None:
+            enum_name = f"{prefix}.{enum_desc.name}" if prefix else enum_desc.name
             value_comments: dict[str, str] = {}
 
             # Enum values: EnumDescriptorProto.value = 2
             for j, v in enumerate(enum_desc.value):
-                c = comment_for_path([5, i, 2, j])
+                c = comment_for_path([*base_path, 2, j])
                 if c:
                     value_comments[v.name] = normalize_inline_comment(c)
 
-            file_enum_comments[enum_name] = EnumComments(enum=enum_comment, values=value_comments)
+            file_enum_comments[enum_name] = EnumComments(enum=comment_for_path(base_path), values=value_comments)
+
+        def walk_message(msg_desc: descriptor_pb2.DescriptorProto, prefix: str, base_path: list[int]) -> None:
+            full_name = f"{prefix}.{msg_desc.name}" if prefix else msg_desc.name
+            # Nested enums: DescriptorProto.enum_type = 4
+            for k, enum_desc in enumerate(msg_desc.enum_type):
+                walk_enum(enum_desc, full_name, [*base_path, 4, k])
+            # Nested messages: DescriptorProto.nested_type = 3
+            for n, nested in enumerate(msg_desc.nested_type):
+                walk_message(nested, full_name, [*base_path, 3, n])
+
+        # Top-level enums: FileDescriptorProto.enum_type = 5
+        for i, enum_desc in enumerate(fd.enum_type):
+            walk_enum(enum_desc, "", [5, i])
+
+        # Enums nested in messages: FileDescriptorProto.message_type = 4
+        for i, msg_desc in enumerate(fd.message_type):
+            walk_message(msg_desc, "", [4, i])
 
         all_enum_comments[fd.name] = file_enum_comments
 
@@ -585,6 +600,9 @@ class MessageInfo:
             init_args.append(f"{name}: {py_type} = ...")
 
         add_line("")
+        # A bare * must be followed by at least one keyword argument, so drop it for messages with no fields
+        if init_args == ["self", "*"]:
+            init_args = ["self"]
         init_args_str = ", ".join(init_args)
         add_line(f"    def __init__({init_args_str}): ...")
         add_line("")
@@ -691,10 +709,6 @@ class ModuleCollection:
             if ent_name in mod_info.messages:
                 return
 
-            assert len(ent_desc.enum_types) == 0, (
-                f"Enums defined within message classes are not supported (message: {ent_namespaced_name})"
-            )
-
             message = MessageInfo(module_name=ent_mod_name, name=ent_name, map_types=None)
             mod_info.messages[ent_name] = message
             print(f"... Adding message {ent_namespaced_name}")
@@ -794,6 +808,17 @@ class ModuleCollection:
             self._collect_descriptor(mod_info, msg_desc)
         for enum_desc in cast(dict[str, EnumDescriptor], mod_desc.enum_types_by_name).values():
             self._collect_descriptor(mod_info, enum_desc)
+
+        # Nested types are exposed under underscore-joined names (Outer.Inner becomes Outer_Inner), so two different
+        # entities can end up with the same name; reject that here instead of generating code that doesn't compile
+        entity_for_flat_name: dict[str, str] = {}
+        for ent_name in (*mod_info.messages.keys(), *mod_info.enums.keys()):
+            flat_name = cc_name_for_python_name(ent_name)
+            other_ent_name = entity_for_flat_name.setdefault(flat_name, ent_name)
+            if other_ent_name != ent_name:
+                raise ValueError(
+                    f"{other_ent_name} and {ent_name} in {mod_info.name} would both be named {flat_name}; rename one of them"
+                )
 
         mod_info._in_progress = False
         return mod_info

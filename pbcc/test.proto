@@ -158,3 +158,43 @@ message TestFieldOrdering {
     int32 second_field = 2;
     string fourth_field = 4;
 }
+
+// A message with nested enum and message declarations. In pbcc, nested types are exposed with underscore-joined names
+// (e.g. TestNested_Kind and TestNested_Inner).
+message TestNested {
+    // This is a nested enum comment. It should be attached to TestNested_Kind.
+    enum Kind {
+        KIND_UNKNOWN = 0;
+        KIND_A = 1;  // This is a nested enum value comment.
+        KIND_B = -2;
+    }
+    message Inner {
+        enum Color {
+            COLOR_RED = 0;
+            COLOR_GREEN = 7;
+        }
+        Color f_color = 1;
+        Kind f_kind = 2;
+    }
+    Kind f_kind = 1;
+    repeated Kind f_kinds = 2;
+    optional Kind f_maybe_kind = 3;
+    Inner f_inner = 4;
+    map<string, Kind> f_string_kind = 5;
+    oneof f_kind_or_string {
+        Inner.Color f_oneof_color = 6;
+        string f_oneof_string = 7;
+    }
+}
+
+// A message with no fields, like google.protobuf.Empty.
+message TestEmpty {}
+
+// Refers to nested types from outside the message that declares them.
+message TestNestedReferences {
+    TestNested.Kind f_kind = 1;
+    TestNested.Inner.Color f_color = 2;
+    TestNested.Inner f_inner = 3;
+    optional TestEmpty f_empty = 4;
+    repeated TestEmpty f_empties = 5;
+}
